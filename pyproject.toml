@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ffap"
+version = "0.1.0"
+description = "Feature-Fidelity-Aware Pruning experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "accelerate",
+  "datasets",
+  "einops",
+  "huggingface-hub",
+  "lm-eval",
+  "numpy",
+  "pyyaml",
+  "safetensors",
+  "sae-lens",
+  "scikit-learn",
+  "scipy",
+  "torch",
+  "tqdm",
+  "transformers",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ffap*"]
+

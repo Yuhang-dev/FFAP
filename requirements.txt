@@ -1,0 +1,15 @@
+accelerate
+datasets
+einops
+huggingface-hub
+lm-eval
+numpy
+pyyaml
+safetensors
+sae-lens
+scikit-learn
+scipy
+torch
+tqdm
+transformers
+
