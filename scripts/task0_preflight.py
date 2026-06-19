@@ -80,16 +80,24 @@ def torch_probe() -> dict[str, Any]:
     except Exception as exc:
         return {"import_ok": False, "error": repr(exc)}
 
+    supported_arches = []
+    try:
+        supported_arches = list(torch.cuda.get_arch_list())
+    except Exception as exc:
+        supported_arches = [f"ERROR: {type(exc).__name__}: {exc}"]
+
     payload: dict[str, Any] = {
         "import_ok": True,
         "version": getattr(torch, "__version__", None),
         "cuda_available": torch.cuda.is_available(),
         "cuda_version": getattr(torch.version, "cuda", None),
         "device_count": torch.cuda.device_count(),
+        "supported_arches": supported_arches,
     }
     devices = []
     for index in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(index)
+        arch = f"sm_{props.major}{props.minor}"
         devices.append(
             {
                 "index": index,
@@ -97,10 +105,23 @@ def torch_probe() -> dict[str, Any]:
                 "total_memory_gib": round(props.total_memory / 1024**3, 2),
                 "major": props.major,
                 "minor": props.minor,
+                "arch": arch,
+                "supported_by_torch_build": arch in supported_arches,
             }
         )
     payload["devices"] = devices
+    payload["all_visible_devices_supported"] = bool(devices) and all(
+        device.get("supported_by_torch_build") for device in devices
+    )
     return payload
+
+
+def preflight_status(torch_payload: dict[str, Any]) -> str:
+    if not torch_payload.get("cuda_available"):
+        return "FAIL_NO_CUDA"
+    if not torch_payload.get("all_visible_devices_supported"):
+        return "FAIL_UNSUPPORTED_GPU_ARCH"
+    return "PASS"
 
 
 def main() -> int:
@@ -129,9 +150,7 @@ def main() -> int:
         "nvidia_smi": run_command(["nvidia-smi"], timeout=30),
         "disk": run_command(["df", "-h"], timeout=30),
     }
-    payload["status"] = (
-        "PASS" if payload["torch"].get("cuda_available") else "FAIL_NO_CUDA"
-    )
+    payload["status"] = preflight_status(payload["torch"])
     write_json(args.out, payload)
 
     print(f"wrote {args.out}")

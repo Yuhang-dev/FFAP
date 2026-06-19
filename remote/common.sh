@@ -37,6 +37,9 @@ configure_ffap_env() {
   export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$DATA_DISK/pip_cache}"
   export FFAP_PIP_INDEX_URL="${FFAP_PIP_INDEX_URL:-https://pypi.org/simple}"
   export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+  if [[ ! "${OMP_NUM_THREADS:-}" =~ ^[0-9]+$ ]]; then
+    export OMP_NUM_THREADS=1
+  fi
 }
 
 install_ffap_no_deps() {
