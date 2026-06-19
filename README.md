@@ -87,6 +87,13 @@ cd /root/autodl-tmp/ffap
 bash remote/run_stage1_wanda_sweep.sh
 ```
 
+Build Stage 1 comparison figure:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/run_stage1_make_figures.sh
+```
+
 Artifacts:
 
 ```text
@@ -102,6 +109,8 @@ results/stage1_smoke.csv
 results/stage1_magnitude_sweep.csv
 results/stage1_capability_eval.csv
 results/stage1_wanda_sweep.csv
+results/stage1_pruning_comparison.csv
+figures/stage1_ppl_vs_featuredamage.png
 ```
 
 ## Local Policy
