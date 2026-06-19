@@ -73,6 +73,13 @@ cd /root/autodl-tmp/ffap
 bash remote/run_stage1_magnitude_sweep.sh
 ```
 
+Run small-subset capability eval for dense and saved magnitude checkpoints:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/run_stage1_capability_eval.sh
+```
+
 Artifacts:
 
 ```text
@@ -81,9 +88,11 @@ logs/task0_prefetch.json
 logs/task0_smoke.json
 logs/stage1_smoke.json
 logs/stage1_magnitude_sweep.json
+logs/stage1_capability_eval.json
 results/task0_lm_eval/
 results/stage1_smoke.csv
 results/stage1_magnitude_sweep.csv
+results/stage1_capability_eval.csv
 ```
 
 ## Local Policy
