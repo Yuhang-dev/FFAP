@@ -54,7 +54,7 @@ def checkpoint_path(method: str, sparsity: float) -> str:
     raise ValueError(f"Unsupported method for checkpoint inference: {method}")
 
 
-def load_sweep_records(paths: list[str]) -> list[dict[str, Any]]:
+def load_sweep_records(paths: list[str], max_sparsity: float | None = None) -> list[dict[str, Any]]:
     records = []
     for path in paths:
         for row in read_rows(path):
@@ -65,6 +65,8 @@ def load_sweep_records(paths: list[str]) -> list[dict[str, Any]]:
             if target_sparsity is None:
                 target_sparsity = as_float(row.get("sparsity"), 0.0)
             assert target_sparsity is not None
+            if max_sparsity is not None and target_sparsity > max_sparsity:
+                continue
             records.append(
                 {
                     "method": method,
@@ -370,23 +372,35 @@ def main() -> int:
     parser.add_argument(
         "--sweep-csv",
         action="append",
-        default=[
-            "results/stage1_magnitude_sweep.csv",
-            "results/stage1_wanda_sweep.csv",
-        ],
+        default=None,
+        help="Repeatable. Defaults to the Stage 1 magnitude and Wanda sweep CSVs.",
     )
     parser.add_argument(
         "--capability-csv",
         action="append",
-        default=[
-            "results/stage1_capability_eval.csv",
-            "results/stage1_wanda_capability_eval.csv",
-        ],
+        default=None,
+        help="Repeatable. Defaults to the Stage 1 magnitude and Wanda capability CSVs.",
+    )
+    parser.add_argument(
+        "--max-sparsity",
+        type=float,
+        default=None,
+        help="Optional robustness filter; excludes sweep rows above this target sparsity.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-json", default="results/stage2_gate.json")
     parser.add_argument("--out-csv", default="results/stage2_gate.csv")
     args = parser.parse_args()
+    if args.sweep_csv is None:
+        args.sweep_csv = [
+            "results/stage1_magnitude_sweep.csv",
+            "results/stage1_wanda_sweep.csv",
+        ]
+    if args.capability_csv is None:
+        args.capability_csv = [
+            "results/stage1_capability_eval.csv",
+            "results/stage1_wanda_capability_eval.csv",
+        ]
 
     started = time.time()
     payload: dict[str, Any] = {
@@ -423,7 +437,9 @@ def main() -> int:
         del dense_model
         torch.cuda.empty_cache()
 
-        records = load_sweep_records(args.sweep_csv)
+        records = load_sweep_records(args.sweep_csv, args.max_sparsity)
+        if not records:
+            raise RuntimeError("No sweep rows remained after applying filters.")
         ability_meta, ability_losses = load_capability_losses(args.capability_csv)
         rows = []
         for record in records:
