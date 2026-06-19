@@ -8,4 +8,5 @@ cd "$FFAP_ROOT"
 activate_pbp_if_needed
 configure_ffap_env
 
-python -m pip install -e . --no-build-isolation
+install_ffap_no_deps
+install_task0_deps

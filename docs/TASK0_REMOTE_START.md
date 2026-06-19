@@ -27,7 +27,6 @@ export FFAP_ROOT=$DATA_DISK/ffap
 
 ffapenv() {
   cd "$FFAP_ROOT"
-  source /etc/network_turbo
   conda activate pbp
   export PYTHONPATH="$FFAP_ROOT:${PYTHONPATH:-}"
 }
@@ -47,6 +46,14 @@ Do not run the full smoke test until `logs/task0_preflight.json` reports
 `status: PASS`.
 
 ## Smoke Command
+
+Install Task 0 Python dependencies from official PyPI. This intentionally uses
+`https://pypi.org/simple` instead of the AutoDL default mirror:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/install_task0_deps.sh
+```
 
 Prefetch required model/SAE assets first:
 

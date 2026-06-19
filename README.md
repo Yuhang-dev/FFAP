@@ -23,6 +23,13 @@ cd /root/autodl-tmp/ffap
 bash remote/run_task0_preflight.sh
 ```
 
+Install Task 0 Python dependencies from official PyPI:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/install_task0_deps.sh
+```
+
 Prefetch Task 0 assets:
 
 ```bash

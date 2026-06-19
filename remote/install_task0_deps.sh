@@ -8,8 +8,6 @@ cd "$FFAP_ROOT"
 activate_pbp_if_needed
 configure_ffap_env
 
-export PYTHONPATH="$FFAP_ROOT:${PYTHONPATH:-}"
-mkdir -p logs results figures
-
 install_ffap_no_deps
-python scripts/task0_prefetch.py --out logs/task0_prefetch.json "$@"
+install_task0_deps
+

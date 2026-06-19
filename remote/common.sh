@@ -35,5 +35,17 @@ configure_ffap_env() {
   export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
   export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-60}"
   export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$DATA_DISK/pip_cache}"
+  export FFAP_PIP_INDEX_URL="${FFAP_PIP_INDEX_URL:-https://pypi.org/simple}"
   export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+}
+
+install_ffap_no_deps() {
+  python -m pip install -e . --no-build-isolation --no-deps
+}
+
+install_task0_deps() {
+  python -m pip install \
+    --index-url "$FFAP_PIP_INDEX_URL" \
+    --cache-dir "$PIP_CACHE_DIR" \
+    einops scipy scikit-learn sae-lens lm-eval
 }
