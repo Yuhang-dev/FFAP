@@ -66,6 +66,13 @@ cd /root/autodl-tmp/ffap
 bash remote/run_stage1_smoke.sh
 ```
 
+Run the Stage 1 magnitude sparsity sweep:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/run_stage1_magnitude_sweep.sh
+```
+
 Artifacts:
 
 ```text
@@ -73,8 +80,10 @@ logs/task0_preflight.json
 logs/task0_prefetch.json
 logs/task0_smoke.json
 logs/stage1_smoke.json
+logs/stage1_magnitude_sweep.json
 results/task0_lm_eval/
 results/stage1_smoke.csv
+results/stage1_magnitude_sweep.csv
 ```
 
 ## Local Policy
