@@ -49,14 +49,22 @@ def run_command(command: list[str], timeout: int = 30) -> dict[str, Any]:
     started = time.time()
     if shutil.which(command[0]) is None:
         return {"ok": False, "error": f"{command[0]} not found"}
-    proc = subprocess.run(
-        command,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "ok": False,
+            "elapsed_sec": round(time.time() - started, 3),
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
     return {
         "ok": proc.returncode == 0,
         "returncode": proc.returncode,
@@ -135,4 +143,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
