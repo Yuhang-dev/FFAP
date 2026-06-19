@@ -30,6 +30,13 @@ cd /root/autodl-tmp/ffap
 bash remote/install_task0_deps.sh
 ```
 
+If PyTorch was downgraded on a Blackwell GPU, repair it with:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/repair_blackwell_torch.sh
+```
+
 Prefetch Task 0 assets:
 
 ```bash
