@@ -108,8 +108,9 @@ bash remote/run_stage2_gate_causal_v2.sh \
   --advbench-path data/advbench/harmful_behaviors.csv
 ```
 
-See `docs/STAGE2_V2_REMOTE.md` for the smoke command and artifact layout. The
-v2 runner always stops at the Stage 2 human-confirmation gate.
+See `docs/STAGE2_V2_REMOTE.md` for the local/whole intervention scopes, smoke
+command, and artifact layout. The v2 runner always stops at the Stage 2
+human-confirmation gate.
 
 Artifacts:
 
@@ -131,6 +132,8 @@ figures/stage1_ppl_vs_featuredamage.png
 results/stage2_gate.json
 results/stage2_gate.csv
 results/stage2_gate_v2.json
+results/stage2_gate_v2_local.json
+results/stage2_gate_v2_whole.json
 results/stage2_v2_models.csv
 results/stage2_v2_examples.csv
 ```

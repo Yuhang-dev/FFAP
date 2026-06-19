@@ -5,8 +5,10 @@ that A/B/C are genuine matched-checkpoint interventions. The default is
 `google/gemma-2-2b-it` with the frozen layer-12 Gemma Scope 16K SAE.
 
 The run is deliberately split into causal measurement, intervention, and
-analysis. Every step writes a JSON log and the final analysis stops before
-Stage 3.
+analysis. Intervention has two preregistered scopes: `local` prunes only the
+layer-12 residual writers at 50-80%, while `whole` prunes the full model at
+30-60%. Every step writes a JSON log and the final analysis stops before Stage
+3.
 
 ## Required inputs
 
@@ -26,7 +28,9 @@ bash remote/run_stage2_gate_causal_v2.sh \
   --refusal-limit 8 \
   --ablation-eval-limit 4 \
   --validation-features-per-tail 1 \
-  --sparsities 0.30 \
+  --scope both \
+  --local-sparsities 0.70 \
+  --whole-sparsities 0.40 \
   --ppl-blocks 2 \
   --feature-blocks 2 \
   --calib-blocks 2 \
@@ -35,8 +39,15 @@ bash remote/run_stage2_gate_causal_v2.sh \
   --artifact-dir results/stage2_v2_smoke/artifacts \
   --model-csv results/stage2_v2_smoke_models.csv \
   --example-csv results/stage2_v2_smoke_examples.csv \
+  --local-out-json results/stage2_gate_v2_smoke_local.json \
+  --whole-out-json results/stage2_gate_v2_smoke_whole.json \
   --out-json results/stage2_gate_v2_smoke.json
 ```
+
+The smoke numbers are not scientific evidence. Check only that both scopes
+finish, A/B/C protection budgets and actual sparsities match, A/C and B/C masks
+are different, every protected weight came from the baseline Wanda at-risk set,
+no protected weight was pruned, and every group rescued at least one weight.
 
 ## Full run
 
@@ -56,5 +67,16 @@ To repeat only statistics and gate rendering:
 bash remote/run_stage2_gate_causal_v2.sh --step analyze
 ```
 
-The final artifact is `results/stage2_gate_v2.json`. Do not start Stage 3 until
-its `gate_status` has been reviewed by a human.
+The analysis writes:
+
+```text
+results/stage2_gate_v2_local.json
+results/stage2_gate_v2_whole.json
+results/stage2_gate_v2.json
+```
+
+The local and whole JSON files contain scope-specific manipulation checks,
+continuous-margin and binary paired tests, mask diagnostics, and scope gates.
+The final JSON applies the preregistered meta-decision. `INCONCLUSIVE_NO_DAMAGE`
+and `CONTRAST_COLLAPSE` are technical outcomes, not scientific failures. Do not
+start Stage 3 until the final result has been reviewed by a human.

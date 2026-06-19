@@ -852,6 +852,7 @@ def protection_masks(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     modules = dict(model.named_modules())
     candidates: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+    at_risk_masks: dict[str, torch.Tensor] = {}
     total_writer_weights = sum(modules[name].weight.numel() for name in writer_names)
     budget = max(1, int(total_writer_weights * protect_fraction))
     generator = torch.Generator(device="cpu").manual_seed(seed)
@@ -865,6 +866,9 @@ def protection_masks(
         rms = input_stats[f"{name}.weight"]["rms"].to(weight.device)
         base = weight.abs().float() * rms.unsqueeze(0)
         at_risk = torch.topk(base, prune_per_row, dim=1, largest=False).indices
+        at_risk_mask = torch.zeros_like(weight, dtype=torch.bool)
+        at_risk_mask.scatter_(1, at_risk, True)
+        at_risk_masks[name] = at_risk_mask.cpu()
         at_risk_base = base.gather(1, at_risk)
         if group == "C_random":
             score = torch.rand(at_risk_base.shape, generator=generator, device="cpu").to(
@@ -898,12 +902,15 @@ def protection_masks(
         masks[name].view(-1)[module_flat] = True
         offset += count
     protected = sum(int(mask.sum()) for mask in masks.values())
+    if any(bool((masks[name] & ~at_risk_masks[name]).any()) for name in writer_names):
+        raise RuntimeError(f"{group} protection mask escaped the baseline Wanda at-risk set.")
     return masks, {
         "group": group,
         "writer_modules": writer_names,
         "protect_fraction": protect_fraction,
         "protected_weights": protected,
         "total_writer_weights": total_writer_weights,
+        "at_risk_subset_verified": True,
     }
 
 
@@ -913,13 +920,19 @@ def apply_protected_wanda(
     input_stats: dict[str, dict[str, Any]],
     sparsity: float,
     masks: dict[str, torch.Tensor],
+    scope: str,
+    writer_names: list[str],
 ) -> dict[str, Any]:
     modules = prunable_linear_modules(model)
     total = 0
     pruned = 0
     protected_total = 0
+    rescued_total = 0
+    protected_pruned_overlap = 0
     layers = []
     for name, module in tqdm(modules.items(), desc="Protected Wanda prune"):
+        if scope == "local" and name not in writer_names:
+            continue
         key = f"{name}.weight"
         weight = module.weight
         cols = weight.shape[1]
@@ -928,6 +941,9 @@ def apply_protected_wanda(
             continue
         rms = input_stats[key]["rms"].to(weight.device)
         metric = weight.detach().abs().float() * rms.unsqueeze(0)
+        baseline_indices = torch.topk(metric, k, dim=1, largest=False).indices
+        baseline_mask = torch.zeros_like(weight, dtype=torch.bool)
+        baseline_mask.scatter_(1, baseline_indices, True)
         protected = masks.get(name)
         if protected is not None:
             protected = protected.to(weight.device)
@@ -936,11 +952,17 @@ def apply_protected_wanda(
                 raise RuntimeError(f"Protection mask exceeds row capacity for {name}.")
             metric[protected] = torch.inf
             protected_total += int(protected.sum())
+            if bool((protected & ~baseline_mask).any()):
+                raise RuntimeError(f"Protected weights were not baseline at-risk in {name}.")
         prune_indices = torch.topk(metric, k, dim=1, largest=False).indices
         prune_mask = torch.zeros_like(weight, dtype=torch.bool)
         prune_mask.scatter_(1, prune_indices, True)
-        if protected is not None and bool((prune_mask & protected).any()):
+        overlap = int((prune_mask & protected).sum()) if protected is not None else 0
+        protected_pruned_overlap += overlap
+        if overlap:
             raise RuntimeError(f"Protected weights selected for pruning in {name}.")
+        rescued = int((baseline_mask & ~prune_mask).sum())
+        rescued_total += rescued
         weight[prune_mask] = 0
         pruned_this = int(prune_mask.sum())
         total += weight.numel()
@@ -951,9 +973,12 @@ def apply_protected_wanda(
                 "pruned": pruned_this,
                 "numel": weight.numel(),
                 "protected": int(protected.sum()) if protected is not None else 0,
+                "rescued": rescued,
             }
         )
-        del metric, prune_indices, prune_mask
+        del metric, baseline_indices, baseline_mask, prune_indices, prune_mask
+    if protected_total and rescued_total <= 0:
+        raise RuntimeError(f"{scope} intervention protected weights but rescued none.")
     return {
         "method": "wanda_with_controlled_protection",
         "target_sparsity": sparsity,
@@ -961,7 +986,50 @@ def apply_protected_wanda(
         "total_pruned": pruned,
         "total_considered": total,
         "protected_weights": protected_total,
+        "rescued_weights": rescued_total,
+        "protected_pruned_overlap": protected_pruned_overlap,
+        "scope": scope,
         "layers": layers,
+    }
+
+
+def mask_diagnostics(
+    masks_by_group: dict[str, dict[str, torch.Tensor]],
+) -> dict[str, Any]:
+    groups = ("A_causal", "B_geometry", "C_random")
+    flattened = {
+        group: torch.cat(
+            [masks_by_group[group][name].flatten() for name in sorted(masks_by_group[group])]
+        )
+        for group in groups
+    }
+    counts = {group: int(flattened[group].sum()) for group in groups}
+    if len(set(counts.values())) != 1:
+        raise RuntimeError(f"A/B/C protection budgets differ: {counts}")
+    pairwise = {}
+    for left, right in (("A_causal", "B_geometry"), ("A_causal", "C_random"), ("B_geometry", "C_random")):
+        intersection = int((flattened[left] & flattened[right]).sum())
+        union = int((flattened[left] | flattened[right]).sum())
+        pairwise[f"{left}_vs_{right}"] = {
+            "identical": bool(torch.equal(flattened[left], flattened[right])),
+            "intersection": intersection,
+            "union": union,
+            "jaccard": intersection / max(1, union),
+        }
+    if pairwise["A_causal_vs_C_random"]["identical"]:
+        raise RuntimeError("A causal and C random protection masks are identical.")
+    if pairwise["B_geometry_vs_C_random"]["identical"]:
+        raise RuntimeError("B geometry and C random protection masks are identical.")
+    contrast_collapsed = pairwise["A_causal_vs_B_geometry"]["jaccard"] >= 0.95
+    return {
+        "counts": counts,
+        "pairwise": pairwise,
+        "contrast_collapsed": contrast_collapsed,
+        "conclusion": (
+            "A/B causal-versus-geometry contrast collapsed."
+            if contrast_collapsed
+            else "A/B/C protection masks have usable contrast."
+        ),
     }
 
 
@@ -1427,112 +1495,34 @@ def run_intervention_seed(
             "B_geometry": geometry_row_importance,
             "C_random": None,
         }
-        for sparsity in args.sparsity_values:
-            for group_index, (group, row_importance) in enumerate(groups.items()):
-                model = load_model(args.model_id, device)
-                masks, protection = protection_masks(
-                    model,
-                    input_stats,
-                    writer_names,
-                    row_importance,
-                    sparsity,
-                    args.protect_fraction,
-                    group,
-                    seed * 10007 + group_index * 101 + int(sparsity * 1000),
-                )
-                pruning = apply_protected_wanda(model, input_stats, sparsity, masks)
-                saved = save_pruned_checkpoint(
-                    model,
-                    tokenizer,
-                    str(Path(args.checkpoint_root) / f"seed{seed}"),
-                    group,
-                    sparsity,
-                    args.save_checkpoints,
-                )
-                ability_loss, ability_rows = evaluate_objective(
-                    model, tokenizer, ability, args.max_length, device
-                )
-                refusal_loss, refusal_preference = evaluate_objective(
-                    model, tokenizer, refusal, args.max_length, device
-                )
-                refusal_generation = generate_refusal_rows(
-                    model,
-                    tokenizer,
-                    refusal_examples,
-                    args.use_chat_template,
-                    args.max_length,
-                    args.refusal_max_new_tokens,
-                    args.generation_batch_size,
-                    device,
-                )
-                refusal_rows = merge_refusal_rows(refusal_preference, refusal_generation)
-                ppl = evaluate_ppl(model, ppl_blocks)
-                ability_features = collect_feature_stats(model, sae, ability_blocks, args.layer)
-                refusal_features = collect_feature_stats(model, sae, refusal_blocks, args.layer)
-                ability_summary = objective_summary(ability_rows)
-                refusal_summary = {
-                    "refusal_rate": float(np.mean([row["refused"] for row in refusal_rows])),
-                    "preference_rate": float(np.mean([row["correct"] for row in refusal_rows])),
-                    "mean_margin": float(np.mean([row["margin"] for row in refusal_rows])),
-                }
-                ability_damage = feature_damage(
-                    dense_ability_features, ability_features,
-                    sharpen_weights(
-                        artifact["ability_causal"],
-                        args.causal_top_fraction,
-                        args.causal_sharpen_power,
-                        positive_only=True,
-                    ),
-                )
-                refusal_damage = feature_damage(
-                    dense_refusal_features, refusal_features,
-                    sharpen_weights(
-                        artifact["refusal_causal"],
-                        args.causal_top_fraction,
-                        args.causal_sharpen_power,
-                        positive_only=True,
-                    ),
-                )
-                checkpoint = saved.get("path") if saved.get("enabled") else None
-                model_rows.append(
-                    {
-                        "seed": seed,
-                        "sparsity": sparsity,
-                        "group": group,
-                        "checkpoint": checkpoint,
-                        "actual_sparsity": pruning["actual_sparsity"],
-                        "protected_weights": protection["protected_weights"],
-                        "ability_accuracy": ability_summary["accuracy"],
-                        "ability_margin": ability_summary["mean_margin"],
-                        "ability_loss": dense_ability["accuracy"] - ability_summary["accuracy"],
-                        "refusal_rate": refusal_summary["refusal_rate"],
-                        "refusal_preference_rate": refusal_summary["preference_rate"],
-                        "refusal_margin": refusal_summary["mean_margin"],
-                        "refusal_loss": dense_refusal["refusal_rate"] - refusal_summary["refusal_rate"],
-                        "ppl": ppl["ppl"],
-                        "ppl_relative_increase": ppl["ppl"] / dense_ppl["ppl"] - 1.0,
-                        **{f"ability_{key}": value for key, value in ability_damage.items()},
-                        **{f"refusal_{key}": value for key, value in refusal_damage.items()},
-                    }
-                )
-                for row in ability_rows:
+        scope_sparsities = {}
+        if args.scope in {"local", "both"}:
+            scope_sparsities["local"] = args.local_sparsity_values
+        if args.scope in {"whole", "both"}:
+            scope_sparsities["whole"] = args.whole_sparsity_values
+        intervention_diagnostics = []
+        for scope_index, (scope, sparsities) in enumerate(scope_sparsities.items()):
+            for sparsity in sparsities:
+                for row in dense_ability_rows:
                     example_rows.append(
                         {
                             "seed": seed,
+                            "scope": scope,
                             "sparsity": sparsity,
-                            "group": group,
+                            "group": "dense",
                             "target": "ability",
                             "unit_id": row["unit_id"],
                             "value": row["correct"],
                             "margin": row["margin"],
                         }
                     )
-                for row in refusal_rows:
+                for row in dense_refusal_rows:
                     example_rows.append(
                         {
                             "seed": seed,
+                            "scope": scope,
                             "sparsity": sparsity,
-                            "group": group,
+                            "group": "dense",
                             "target": "refusal",
                             "unit_id": row["unit_id"],
                             "value": row["refused"],
@@ -1540,26 +1530,181 @@ def run_intervention_seed(
                             "preference_refused": row["correct"],
                         }
                     )
-                del model
-                torch.cuda.empty_cache()
-                write_csv(
-                    Path(args.artifact_dir).parent / f"intervention_seed{seed}_models.csv",
-                    model_rows,
-                )
-                write_csv(
-                    Path(args.artifact_dir).parent / f"intervention_seed{seed}_examples.csv",
-                    example_rows,
-                )
+                masks_by_group = {}
+                scope_rows = []
+                for group_index, (group, row_importance) in enumerate(groups.items()):
+                    model = load_model(args.model_id, device)
+                    masks, protection = protection_masks(
+                        model,
+                        input_stats,
+                        writer_names,
+                        row_importance,
+                        sparsity,
+                        args.protect_fraction,
+                        group,
+                        seed * 10007
+                        + scope_index * 1009
+                        + group_index * 101
+                        + int(sparsity * 1000),
+                    )
+                    masks_by_group[group] = {name: mask.clone() for name, mask in masks.items()}
+                    pruning = apply_protected_wanda(
+                        model, input_stats, sparsity, masks, scope, writer_names
+                    )
+                    save_enabled = args.save_checkpoints and (
+                        scope == "whole" or args.save_local_checkpoints
+                    )
+                    saved = save_pruned_checkpoint(
+                        model,
+                        tokenizer,
+                        str(Path(args.checkpoint_root) / f"seed{seed}"),
+                        f"{scope}_{group}",
+                        sparsity,
+                        save_enabled,
+                    )
+                    _ability_loss, ability_rows = evaluate_objective(
+                        model, tokenizer, ability, args.max_length, device
+                    )
+                    _refusal_loss, refusal_preference = evaluate_objective(
+                        model, tokenizer, refusal, args.max_length, device
+                    )
+                    refusal_generation = generate_refusal_rows(
+                        model,
+                        tokenizer,
+                        refusal_examples,
+                        args.use_chat_template,
+                        args.max_length,
+                        args.refusal_max_new_tokens,
+                        args.generation_batch_size,
+                        device,
+                    )
+                    refusal_rows = merge_refusal_rows(refusal_preference, refusal_generation)
+                    ppl = evaluate_ppl(model, ppl_blocks)
+                    ability_features = collect_feature_stats(model, sae, ability_blocks, args.layer)
+                    refusal_features = collect_feature_stats(model, sae, refusal_blocks, args.layer)
+                    ability_summary = objective_summary(ability_rows)
+                    refusal_summary = {
+                        "refusal_rate": float(np.mean([row["refused"] for row in refusal_rows])),
+                        "preference_rate": float(np.mean([row["correct"] for row in refusal_rows])),
+                        "mean_margin": float(np.mean([row["margin"] for row in refusal_rows])),
+                    }
+                    ability_damage = feature_damage(
+                        dense_ability_features,
+                        ability_features,
+                        sharpen_weights(
+                            artifact["ability_causal"],
+                            args.causal_top_fraction,
+                            args.causal_sharpen_power,
+                            positive_only=True,
+                        ),
+                    )
+                    refusal_damage = feature_damage(
+                        dense_refusal_features,
+                        refusal_features,
+                        sharpen_weights(
+                            artifact["refusal_causal"],
+                            args.causal_top_fraction,
+                            args.causal_sharpen_power,
+                            positive_only=True,
+                        ),
+                    )
+                    checkpoint = saved.get("path") if saved.get("enabled") else None
+                    model_row = {
+                        "seed": seed,
+                        "scope": scope,
+                        "sparsity": sparsity,
+                        "group": group,
+                        "checkpoint": checkpoint,
+                        "actual_sparsity": pruning["actual_sparsity"],
+                        "protected_weights": protection["protected_weights"],
+                        "rescued_weights": pruning["rescued_weights"],
+                        "protected_pruned_overlap": pruning["protected_pruned_overlap"],
+                        "ability_accuracy": ability_summary["accuracy"],
+                        "ability_margin": ability_summary["mean_margin"],
+                        "ability_loss": dense_ability["accuracy"] - ability_summary["accuracy"],
+                        "ability_margin_loss": dense_ability["mean_margin"] - ability_summary["mean_margin"],
+                        "refusal_rate": refusal_summary["refusal_rate"],
+                        "refusal_preference_rate": refusal_summary["preference_rate"],
+                        "refusal_margin": refusal_summary["mean_margin"],
+                        "refusal_loss": dense_refusal["refusal_rate"] - refusal_summary["refusal_rate"],
+                        "refusal_margin_loss": dense_refusal["mean_margin"] - refusal_summary["mean_margin"],
+                        "ppl": ppl["ppl"],
+                        "ppl_relative_increase": ppl["ppl"] / dense_ppl["ppl"] - 1.0,
+                        **{f"ability_{key}": value for key, value in ability_damage.items()},
+                        **{f"refusal_{key}": value for key, value in refusal_damage.items()},
+                    }
+                    model_rows.append(model_row)
+                    scope_rows.append(model_row)
+                    for row in ability_rows:
+                        example_rows.append(
+                            {
+                                "seed": seed,
+                                "scope": scope,
+                                "sparsity": sparsity,
+                                "group": group,
+                                "target": "ability",
+                                "unit_id": row["unit_id"],
+                                "value": row["correct"],
+                                "margin": row["margin"],
+                            }
+                        )
+                    for row in refusal_rows:
+                        example_rows.append(
+                            {
+                                "seed": seed,
+                                "scope": scope,
+                                "sparsity": sparsity,
+                                "group": group,
+                                "target": "refusal",
+                                "unit_id": row["unit_id"],
+                                "value": row["refused"],
+                                "margin": row["margin"],
+                                "preference_refused": row["correct"],
+                            }
+                        )
+                    del model
+                    torch.cuda.empty_cache()
+                    write_csv(
+                        Path(args.artifact_dir).parent / f"intervention_seed{seed}_models.csv",
+                        model_rows,
+                    )
+                    write_csv(
+                        Path(args.artifact_dir).parent / f"intervention_seed{seed}_examples.csv",
+                        example_rows,
+                    )
 
-        for sparsity in args.sparsity_values:
-            matched = [row for row in model_rows if row["sparsity"] == sparsity]
-            if len(matched) != 3:
-                raise RuntimeError(f"Expected three intervention groups at sparsity {sparsity}.")
-            if len({row["protected_weights"] for row in matched}) != 1:
-                raise RuntimeError(f"Protection budgets differ across A/B/C at sparsity {sparsity}.")
-            actual = [float(row["actual_sparsity"]) for row in matched]
-            if max(actual) - min(actual) > 1e-9:
-                raise RuntimeError(f"Actual sparsity differs across A/B/C at target {sparsity}.")
+                diagnostic = mask_diagnostics(masks_by_group)
+                diagnostic.update({"seed": seed, "scope": scope, "sparsity": sparsity})
+                intervention_diagnostics.append(diagnostic)
+                if len(scope_rows) != 3:
+                    raise RuntimeError(
+                        f"Expected three {scope} groups at sparsity {sparsity}."
+                    )
+                if len({row["protected_weights"] for row in scope_rows}) != 1:
+                    raise RuntimeError(
+                        f"Protection budgets differ across {scope} A/B/C at {sparsity}."
+                    )
+                actual = [float(row["actual_sparsity"]) for row in scope_rows]
+                if max(actual) - min(actual) > 1e-9:
+                    raise RuntimeError(
+                        f"Actual sparsity differs across {scope} A/B/C at {sparsity}."
+                    )
+                if any(int(row["rescued_weights"]) <= 0 for row in scope_rows):
+                    raise RuntimeError(
+                        f"At least one {scope} group rescued no weights at {sparsity}."
+                    )
+                diagnostic["protected_weights"] = {
+                    row["group"]: int(row["protected_weights"]) for row in scope_rows
+                }
+                diagnostic["rescued_weights"] = {
+                    row["group"]: int(row["rescued_weights"]) for row in scope_rows
+                }
+                diagnostic["actual_sparsity"] = {
+                    row["group"]: float(row["actual_sparsity"]) for row in scope_rows
+                }
+
+        diagnostics_path = Path(args.artifact_dir).parent / f"intervention_seed{seed}_diagnostics.json"
+        write_json(diagnostics_path, {"seed": seed, "diagnostics": intervention_diagnostics})
 
         summary = {
             "dense": {
@@ -1572,7 +1717,8 @@ def run_intervention_seed(
             "models": len(model_rows),
             "example_rows": len(example_rows),
             "groups": sorted(groups),
-            "sparsities": args.sparsity_values,
+            "scope_sparsities": scope_sparsities,
+            "mask_diagnostics": intervention_diagnostics,
             "sae_transfer": {
                 "ability_reconstruction_mse": dense_ability_features["reconstruction_mse"],
                 "ability_decoded_cosine": dense_ability_features["decoded_activation_cosine"],
@@ -1610,6 +1756,7 @@ def run_intervention_seed(
 
 def paired_arrays(
     rows: list[dict[str, Any]],
+    scope: str,
     target: str,
     group_a: str,
     group_b: str,
@@ -1618,12 +1765,12 @@ def paired_arrays(
     a = {
         (int(row["seed"]), float(row["sparsity"]), row["unit_id"]): float(row[metric])
         for row in rows
-        if row["target"] == target and row["group"] == group_a
+        if row["scope"] == scope and row["target"] == target and row["group"] == group_a
     }
     b = {
         (int(row["seed"]), float(row["sparsity"]), row["unit_id"]): float(row[metric])
         for row in rows
-        if row["target"] == target and row["group"] == group_b
+        if row["scope"] == scope and row["target"] == target and row["group"] == group_b
     }
     keys = sorted(set(a) & set(b))
     if not keys:
@@ -1638,12 +1785,15 @@ def paired_arrays(
 
 def paired_test(
     rows: list[dict[str, Any]],
+    scope: str,
     target: str,
-    comparator: str,
+    group_a: str,
+    group_b: str,
+    metric: str,
     bootstrap_samples: int,
     seed: int,
 ) -> dict[str, Any]:
-    a, b, cluster_labels = paired_arrays(rows, target, "A_causal", comparator)
+    a, b, cluster_labels = paired_arrays(rows, scope, target, group_a, group_b, metric)
     differences = a - b
     rng = np.random.default_rng(seed)
     unique_clusters = sorted(set(cluster_labels))
@@ -1682,12 +1832,14 @@ def paired_test(
         wilcoxon_stat = None
         wilcoxon_p = 1.0
     return {
+        "scope": scope,
         "target": target,
-        "comparison": f"A_causal_vs_{comparator}",
+        "metric": metric,
+        "comparison": f"{group_a}_vs_{group_b}",
         "n_pairs": int(differences.size),
         "n_seed_sparsity_clusters": len(unique_clusters),
         "a_mean": float(a.mean()),
-        "comparator_mean": float(b.mean()),
+        "b_mean": float(b.mean()),
         "mean_difference": float(differences.mean()),
         "bootstrap_ci95": [float(ci_low), float(ci_high)],
         "bootstrap_p_two_sided": p_boot,
@@ -1696,46 +1848,96 @@ def paired_test(
     }
 
 
-def intervention_statistics(
-    example_rows: list[dict[str, Any]],
-    bootstrap_samples: int,
-    seed: int,
-) -> dict[str, Any]:
-    tests = {}
-    offset = 0
-    for target in ("ability", "refusal"):
-        for comparator in ("B_geometry", "C_random"):
-            key = f"{target}_A_vs_{comparator[0]}"
-            tests[key] = paired_test(
-                example_rows,
-                target,
-                comparator,
-                bootstrap_samples,
-                seed + offset,
-            )
-            offset += 1
-    ordered = sorted(tests, key=lambda key: tests[key]["bootstrap_p_two_sided"])
+def apply_holm(tests: dict[str, dict[str, Any]], keys: list[str]) -> None:
+    ordered = sorted(keys, key=lambda key: tests[key]["bootstrap_p_two_sided"])
     running = 0.0
     total_tests = len(ordered)
     for rank, key in enumerate(ordered):
         adjusted = min(1.0, (total_tests - rank) * tests[key]["bootstrap_p_two_sided"])
         running = max(running, adjusted)
         tests[key]["bootstrap_p_holm"] = running
+
+
+def intervention_statistics(
+    example_rows: list[dict[str, Any]],
+    scope: str,
+    bootstrap_samples: int,
+    seed: int,
+) -> dict[str, Any]:
+    tests: dict[str, dict[str, Any]] = {}
+    offset = 0
+    primary_keys = []
+    secondary_keys = []
+    for target in ("ability", "refusal"):
+        for comparator in ("B_geometry", "C_random"):
+            short = comparator[0]
+            key = f"{target}_A_vs_{short}_margin"
+            tests[key] = paired_test(
+                example_rows,
+                scope,
+                target,
+                "A_causal",
+                comparator,
+                "margin",
+                bootstrap_samples,
+                seed + offset,
+            )
+            primary_keys.append(key)
+            offset += 1
+            binary_key = f"{target}_A_vs_{short}_binary"
+            tests[binary_key] = paired_test(
+                example_rows,
+                scope,
+                target,
+                "A_causal",
+                comparator,
+                "value",
+                bootstrap_samples,
+                seed + offset,
+            )
+            secondary_keys.append(binary_key)
+            offset += 1
+        for metric in ("margin", "value"):
+            manipulation_key = f"{target}_dense_vs_C_{'binary' if metric == 'value' else metric}"
+            tests[manipulation_key] = paired_test(
+                example_rows,
+                scope,
+                target,
+                "dense",
+                "C_random",
+                metric,
+                bootstrap_samples,
+                seed + offset,
+            )
+            offset += 1
+    apply_holm(tests, primary_keys)
+    apply_holm(tests, secondary_keys)
     group_numbers = {}
     for target in ("ability", "refusal"):
         group_numbers[target] = {
-            group: float(
-                np.mean(
-                    [
-                        float(row["value"])
-                        for row in example_rows
-                        if row["target"] == target and row["group"] == group
-                    ]
+            metric_name: {
+                group: float(
+                    np.mean(
+                        [
+                            float(row[column])
+                            for row in example_rows
+                            if row["scope"] == scope
+                            and row["target"] == target
+                            and row["group"] == group
+                        ]
+                    )
                 )
-            )
-            for group in ("A_causal", "B_geometry", "C_random")
+                for group in ("dense", "A_causal", "B_geometry", "C_random")
+            }
+            for metric_name, column in (("binary", "value"), ("margin", "margin"))
         }
-    return {"group_numbers": group_numbers, "paired_tests": tests}
+    return {
+        "scope": scope,
+        "group_numbers": group_numbers,
+        "paired_tests": tests,
+        "primary_metric": "per-example task/refusal margin",
+        "secondary_metric": "accuracy/generated refusal rate",
+    }
 
 
 def correlation_statistics(model_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1747,44 +1949,50 @@ def correlation_statistics(model_rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
     definitions = {
         "ability": {
-            "outcome": "ability_loss",
+            "outcomes": ("ability_margin_loss", "ability_loss"),
             "causal": "ability_causal_weighted_mean_l1",
             "geometry": "ability_geometry_mean_l1",
         },
         "refusal": {
-            "outcome": "refusal_loss",
+            "outcomes": ("refusal_margin_loss", "refusal_loss"),
             "causal": "refusal_causal_weighted_mean_l1",
             "geometry": "refusal_geometry_mean_l1",
         },
     }
-    for target, definition in definitions.items():
-        target_report = {
-            predictor: safe_spearman(
-                [float(row[column]) for row in model_rows],
-                [float(row[definition["outcome"]]) for row in model_rows],
-            )
-            for predictor, column in (
-                ("causal_weighted_fidelity", definition["causal"]),
-                ("geometry_fidelity", definition["geometry"]),
-                ("ppl_relative_increase", "ppl_relative_increase"),
-            )
-        }
-        by_sparsity = {}
-        for sparsity in sorted({float(row["sparsity"]) for row in model_rows}):
-            subset = [row for row in model_rows if float(row["sparsity"]) == sparsity]
-            by_sparsity[f"{sparsity:.3f}"] = {
-                predictor: safe_spearman(
-                    [float(row[column]) for row in subset],
-                    [float(row[definition["outcome"]]) for row in subset],
-                )
-                for predictor, column in (
-                    ("causal_weighted_fidelity", definition["causal"]),
-                    ("geometry_fidelity", definition["geometry"]),
-                    ("ppl_relative_increase", "ppl_relative_increase"),
-                )
-            }
-        target_report["within_sparsity"] = by_sparsity
-        report[target] = target_report
+    for scope in sorted({row["scope"] for row in model_rows}):
+        scope_rows = [row for row in model_rows if row["scope"] == scope]
+        report[scope] = {}
+        for target, definition in definitions.items():
+            target_report = {}
+            for outcome in definition["outcomes"]:
+                outcome_report = {
+                    predictor: safe_spearman(
+                        [float(row[column]) for row in scope_rows],
+                        [float(row[outcome]) for row in scope_rows],
+                    )
+                    for predictor, column in (
+                        ("causal_weighted_fidelity", definition["causal"]),
+                        ("geometry_fidelity", definition["geometry"]),
+                        ("ppl_relative_increase", "ppl_relative_increase"),
+                    )
+                }
+                by_sparsity = {}
+                for sparsity in sorted({float(row["sparsity"]) for row in scope_rows}):
+                    subset = [row for row in scope_rows if float(row["sparsity"]) == sparsity]
+                    by_sparsity[f"{sparsity:.3f}"] = {
+                        predictor: safe_spearman(
+                            [float(row[column]) for row in subset],
+                            [float(row[outcome]) for row in subset],
+                        )
+                        for predictor, column in (
+                            ("causal_weighted_fidelity", definition["causal"]),
+                            ("geometry_fidelity", definition["geometry"]),
+                            ("ppl_relative_increase", "ppl_relative_increase"),
+                        )
+                    }
+                outcome_report["within_sparsity"] = by_sparsity
+                target_report[outcome] = outcome_report
+            report[scope][target] = target_report
     return report
 
 
@@ -1833,66 +2041,187 @@ def test_is_noninferior(test: dict[str, Any], margin: float) -> bool:
 
 def gate_decision_v2(
     statistics: dict[str, Any],
+    diagnostics: list[dict[str, Any]],
     alpha: float,
-    noninferiority_margin: float,
-    practical_threshold: float,
+    margin_noninferiority: float,
+    margin_practical_threshold: float,
+    binary_practical_threshold: float,
 ) -> dict[str, Any]:
     tests = statistics["paired_tests"]
-    ability_b = tests["ability_A_vs_B"]
-    ability_c = tests["ability_A_vs_C"]
-    refusal_b = tests["refusal_A_vs_B"]
-    refusal_c = tests["refusal_A_vs_C"]
+    ability_b = tests["ability_A_vs_B_margin"]
+    ability_c = tests["ability_A_vs_C_margin"]
+    refusal_b = tests["refusal_A_vs_B_margin"]
+    refusal_c = tests["refusal_A_vs_C_margin"]
+    ability_b_binary = tests["ability_A_vs_B_binary"]
+    ability_c_binary = tests["ability_A_vs_C_binary"]
+    refusal_b_binary = tests["refusal_A_vs_B_binary"]
+    refusal_c_binary = tests["refusal_A_vs_C_binary"]
     ability_over_c = test_is_superior(ability_c, alpha)
     refusal_over_c = test_is_superior(refusal_c, alpha)
     ability_over_b = test_is_superior(ability_b, alpha)
     refusal_over_b = test_is_superior(refusal_b, alpha)
-    ability_at_least_b = test_is_noninferior(ability_b, noninferiority_margin)
-    refusal_at_least_b = test_is_noninferior(refusal_b, noninferiority_margin)
+    ability_at_least_b = test_is_noninferior(ability_b, margin_noninferiority)
+    refusal_at_least_b = test_is_noninferior(refusal_b, margin_noninferiority)
+    ability_binary_direction = (
+        ability_b_binary["mean_difference"] >= -binary_practical_threshold
+        and ability_c_binary["mean_difference"] >= -binary_practical_threshold
+    )
+    refusal_binary_direction = (
+        refusal_b_binary["mean_difference"] >= -binary_practical_threshold
+        and refusal_c_binary["mean_difference"] >= -binary_practical_threshold
+    )
+    manipulation = {}
+    for target in ("ability", "refusal"):
+        margin_test = tests[f"{target}_dense_vs_C_margin"]
+        binary_test = tests[f"{target}_dense_vs_C_binary"]
+        manipulation[target] = {
+            "valid": test_is_superior(margin_test, alpha)
+            or (
+                test_is_superior(binary_test, alpha)
+                and binary_test["mean_difference"] >= binary_practical_threshold
+            ),
+            "dense_minus_C_margin": margin_test["mean_difference"],
+            "dense_minus_C_binary": binary_test["mean_difference"],
+        }
+    contrast_collapsed = bool(diagnostics) and all(
+        bool(item.get("contrast_collapsed")) for item in diagnostics
+    )
 
-    if (
+    if not manipulation["ability"]["valid"] or not manipulation["refusal"]["valid"]:
+        status = "INCONCLUSIVE"
+        technical_status = "INCONCLUSIVE_NO_DAMAGE"
+        conclusion = (
+            "The random-protection control did not create measurable degradation on both targets. "
+            "The A/B/C contrast is not interpretable as a mechanism test."
+        )
+    elif contrast_collapsed:
+        status = "INCONCLUSIVE"
+        technical_status = "CONTRAST_COLLAPSE"
+        conclusion = (
+            "Causal and geometry protection masks overlap at Jaccard >= 0.95 for every configured condition. "
+            "A versus B cannot distinguish causal weighting from geometry."
+        )
+    elif (
         ability_over_c
         and refusal_over_c
         and ability_at_least_b
         and refusal_at_least_b
         and (ability_over_b or refusal_over_b)
+        and ability_binary_direction
+        and refusal_binary_direction
     ):
         status = "PASS"
+        technical_status = "PASS_BOTH_TARGETS"
         conclusion = (
-            "Causal protection beats random protection on ability and refusal, is non-inferior to geometry "
-            "on both, and beats geometry on at least one target. Stop at the Stage 2 gate for human approval."
+            "Causal protection improves continuous ability and refusal margins over random protection, "
+            "is non-inferior to geometry on both, and beats geometry on at least one target without a "
+            "material reversal in binary outcomes."
         )
-    elif refusal_over_c and refusal_over_b and not ability_over_b:
+    elif (
+        refusal_over_c
+        and refusal_over_b
+        and refusal_binary_direction
+        and not ability_over_b
+        and not ability_over_c
+    ):
         status = "REFRAME"
+        technical_status = "REFUSAL_ONLY"
         conclusion = (
             "Causal protection has a refusal-specific advantage without a matching ability advantage. "
             "Reframe as safety-preserving compression and distinguish the static SAE-feature method from AAPP."
         )
     else:
+        primary = (ability_b, ability_c, refusal_b, refusal_c)
         all_small = all(
-            abs(test["mean_difference"]) < practical_threshold for test in tests.values()
+            abs(test["mean_difference"]) < margin_practical_threshold for test in primary
         )
-        any_superior = any(test_is_superior(test, alpha) for test in tests.values())
+        any_superior = any(test_is_superior(test, alpha) for test in primary)
         if all_small and not any_superior:
             status = "FAIL"
+            technical_status = "NULL_WITH_MEASURABLE_DAMAGE"
             conclusion = (
-                "A, B, and C show no statistically or practically meaningful separation on either target. "
-                "Stop and consider diagnostic+quantization or calibration fallback directions."
+                "The control caused measurable degradation, but A, B, and C show no statistically or "
+                "practically meaningful separation on either target."
             )
         else:
-            status = "REFRAME"
+            status = "INCONCLUSIVE"
+            technical_status = "MIXED_UNPREREGISTERED_PATTERN"
             conclusion = (
-                "The result is mixed and does not satisfy the preregistered PASS or true-kill pattern. "
-                "Treat it as a reframe/diagnostic outcome and require human review before any Stage 3 work."
+                "The result is mixed and matches neither the preregistered PASS, refusal-only REFRAME, "
+                "nor true-kill pattern. Human review is required without a scientific verdict."
             )
     return {
         "gate_status": status,
+        "technical_status": technical_status,
+        "scope": statistics["scope"],
         "criteria": {
+            "ability_manipulation_valid": manipulation["ability"]["valid"],
+            "refusal_manipulation_valid": manipulation["refusal"]["valid"],
+            "causal_geometry_contrast_available": not contrast_collapsed,
             "ability_A_gt_C": ability_over_c,
             "refusal_A_gt_C": refusal_over_c,
             "ability_A_ge_B": ability_at_least_b,
             "refusal_A_ge_B": refusal_at_least_b,
             "ability_A_gt_B": ability_over_b,
             "refusal_A_gt_B": refusal_over_b,
+            "ability_binary_direction_ok": ability_binary_direction,
+            "refusal_binary_direction_ok": refusal_binary_direction,
+        },
+        "manipulation_check": manipulation,
+        "conclusion": conclusion,
+        "human_confirmation_required": True,
+        "stage3_started": False,
+    }
+
+
+def meta_gate_decision(scope_decisions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    local = scope_decisions.get("local")
+    whole = scope_decisions.get("whole")
+    if local is None and whole is None:
+        raise RuntimeError("No scope decisions are available for the meta gate.")
+    if local is None:
+        status = whole["gate_status"]
+        tier = "whole_only"
+        conclusion = "Only whole-model intervention was configured; the meta gate mirrors that scope."
+    elif whole is None:
+        status = local["gate_status"]
+        tier = "local_only"
+        conclusion = "Only local intervention was configured; the meta gate mirrors that scope."
+    elif local["gate_status"] == "PASS" and whole["gate_status"] == "PASS":
+        status = "PASS"
+        tier = "mechanism_and_external_validity"
+        conclusion = "Local mechanism and whole-model external-validity gates both pass."
+    elif local["gate_status"] == "PASS":
+        status = "PASS"
+        tier = "mechanism_only"
+        conclusion = (
+            "The local causal mechanism passes, but whole-model transfer does not. Proceed only to "
+            "cross-layer saliency mapping work; this is not a safety-only reframe."
+        )
+    elif local["gate_status"] == "REFRAME" and whole["gate_status"] != "PASS":
+        status = "REFRAME"
+        tier = "refusal_only"
+        conclusion = "The local mechanism is refusal-specific; reframe toward safety-preserving compression."
+    elif local["gate_status"] == "FAIL" and whole["gate_status"] in {"FAIL", "INCONCLUSIVE"}:
+        status = "FAIL"
+        tier = "mechanism_kill"
+        conclusion = "The powered local mechanism test is null; stop the causal-protection method direction."
+    elif local["gate_status"] == "INCONCLUSIVE" and whole["gate_status"] in {"PASS", "REFRAME"}:
+        status = whole["gate_status"]
+        tier = "whole_model_only"
+        conclusion = (
+            "The local scope was technically inconclusive, while the whole-model scope produced a usable "
+            "signal. Treat the verdict as whole-model evidence only."
+        )
+    else:
+        status = "INCONCLUSIVE"
+        tier = "cross_scope_conflict"
+        conclusion = "Local and whole-model scope decisions conflict; no scientific verdict is assigned."
+    return {
+        "gate_status": status,
+        "evidence_tier": tier,
+        "scope_statuses": {
+            scope: decision["gate_status"] for scope, decision in scope_decisions.items()
         },
         "conclusion": conclusion,
         "human_confirmation_required": True,
@@ -1905,6 +2234,20 @@ def load_csv(path: Path) -> list[dict[str, Any]]:
         raise FileNotFoundError(path)
     with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def load_intervention_diagnostics(
+    args: argparse.Namespace,
+    seeds: list[int],
+) -> list[dict[str, Any]]:
+    diagnostics = []
+    for seed in seeds:
+        path = Path(args.artifact_dir).parent / f"intervention_seed{seed}_diagnostics.json"
+        if not path.exists():
+            raise FileNotFoundError(path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        diagnostics.extend(payload.get("diagnostics", []))
+    return diagnostics
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1948,7 +2291,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--causal-sharpen-power", type=float, default=2.0)
     result.add_argument("--protect-fraction", type=float, default=0.02)
     result.add_argument("--seeds", default="0,1,2")
-    result.add_argument("--sparsities", default="0.30,0.40,0.50,0.60")
+    result.add_argument("--scope", choices=["local", "whole", "both"], default="both")
+    result.add_argument(
+        "--sparsities",
+        default=None,
+        help="Compatibility override that applies one grid to every enabled scope.",
+    )
+    result.add_argument("--local-sparsities", default="0.50,0.60,0.70,0.80")
+    result.add_argument("--whole-sparsities", default="0.30,0.40,0.50,0.60")
     result.add_argument("--calib-seq-len", type=int, default=128)
     result.add_argument("--calib-blocks", type=int, default=32)
     result.add_argument("--feature-seq-len", type=int, default=128)
@@ -1959,27 +2309,43 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--ppl-blocks", type=int, default=16)
     result.add_argument("--bootstrap-samples", type=int, default=10000)
     result.add_argument("--alpha", type=float, default=0.05)
-    result.add_argument("--noninferiority-margin", type=float, default=0.01)
-    result.add_argument("--practical-threshold", type=float, default=0.005)
+    result.add_argument("--margin-noninferiority", type=float, default=0.01)
+    result.add_argument("--margin-practical-threshold", type=float, default=0.01)
+    result.add_argument("--binary-practical-threshold", type=float, default=0.005)
     result.add_argument("--save-checkpoints", action=argparse.BooleanOptionalAction, default=True)
+    result.add_argument(
+        "--save-local-checkpoints", action=argparse.BooleanOptionalAction, default=False
+    )
     result.add_argument("--checkpoint-root", default="outputs/stage2_v2")
     result.add_argument("--artifact-dir", default="results/stage2_v2/artifacts")
     result.add_argument("--log-dir", default="logs")
     result.add_argument("--model-csv", default="results/stage2_v2_models.csv")
     result.add_argument("--example-csv", default="results/stage2_v2_examples.csv")
+    result.add_argument("--local-out-json", default="results/stage2_gate_v2_local.json")
+    result.add_argument("--whole-out-json", default="results/stage2_gate_v2_whole.json")
     result.add_argument("--out-json", default="results/stage2_gate_v2.json")
     return result
 
 
 def validate_args(args: argparse.Namespace) -> None:
     args.seed_values = parse_ints(args.seeds)
-    args.sparsity_values = parse_floats(args.sparsities)
+    if args.sparsities:
+        override = parse_floats(args.sparsities)
+        args.local_sparsity_values = override
+        args.whole_sparsity_values = override
+    else:
+        args.local_sparsity_values = parse_floats(args.local_sparsities)
+        args.whole_sparsity_values = parse_floats(args.whole_sparsities)
     if len(args.seed_values) < 3:
         raise ValueError("Stage 2 v2 requires at least three seeds.")
     if not 0 < args.causal_top_fraction <= 1:
         raise ValueError("--causal-top-fraction must be in (0, 1].")
     if not 0 < args.protect_fraction < 1:
         raise ValueError("--protect-fraction must be in (0, 1).")
+    if args.margin_noninferiority < 0:
+        raise ValueError("--margin-noninferiority must be non-negative.")
+    if args.margin_practical_threshold < 0 or args.binary_practical_threshold < 0:
+        raise ValueError("Practical thresholds must be non-negative.")
     if args.attribution_ablation == "zero":
         raise ValueError("zero may be a robustness mode but cannot be the primary attribution ablation.")
     validation_modes = {
@@ -2004,7 +2370,8 @@ def main() -> int:
     config = {
         **vars(args),
         "seed_values": args.seed_values,
-        "sparsity_values": args.sparsity_values,
+        "local_sparsity_values": args.local_sparsity_values,
+        "whole_sparsity_values": args.whole_sparsity_values,
         "sae_frozen": True,
         "causal_importance_definition": "task_matched_attribution_patching",
         "final_gate_source": "paired_A_B_C_intervention",
@@ -2062,9 +2429,17 @@ def main() -> int:
 
         analysis_started = time.time()
         torch.cuda.reset_peak_memory_stats()
-        statistics = intervention_statistics(
-            all_example_rows, args.bootstrap_samples, args.seed_values[0] + 4242
-        )
+        intervention_diagnostics = load_intervention_diagnostics(args, args.seed_values)
+        enabled_scopes = sorted({row["scope"] for row in all_model_rows})
+        scope_statistics = {
+            scope: intervention_statistics(
+                all_example_rows,
+                scope,
+                args.bootstrap_samples,
+                args.seed_values[0] + 4242 + index * 1000,
+            )
+            for index, scope in enumerate(enabled_scopes)
+        }
         correlations = correlation_statistics(all_model_rows)
         sanity = aggregate_sanity(args, args.seed_values)
         correlation_log = Path(args.log_dir) / "stage2_v2_correlation.json"
@@ -2082,16 +2457,62 @@ def main() -> int:
             },
             "Task-matched causal fidelity, geometry fidelity, and PPL were compared on the expanded checkpoint set.",
         )
-        decision = gate_decision_v2(
-            statistics,
-            args.alpha,
-            args.noninferiority_margin,
-            args.practical_threshold,
-        )
+        scope_decisions = {}
+        scope_outputs = {}
+        output_paths = {"local": args.local_out_json, "whole": args.whole_out_json}
+        for scope in enabled_scopes:
+            scope_diagnostics = [
+                item for item in intervention_diagnostics if item["scope"] == scope
+            ]
+            decision = gate_decision_v2(
+                scope_statistics[scope],
+                scope_diagnostics,
+                args.alpha,
+                args.margin_noninferiority,
+                args.margin_practical_threshold,
+                args.binary_practical_threshold,
+            )
+            scope_decisions[scope] = decision
+            scope_result = {
+                "task": f"stage2_gate_causal_v2_{scope}",
+                "status": "COMPLETE",
+                "scope": scope,
+                "gate_status": decision["gate_status"],
+                "technical_status": decision["technical_status"],
+                "config": config,
+                "group_numbers": scope_statistics[scope]["group_numbers"],
+                "paired_tests": scope_statistics[scope]["paired_tests"],
+                "manipulation_check": decision["manipulation_check"],
+                "mask_diagnostics": scope_diagnostics,
+                "correlations": correlations.get(scope),
+                "sanity_check": sanity,
+                "decision": decision,
+                "conclusion": decision["conclusion"],
+            }
+            write_json(output_paths[scope], scope_result)
+            scope_outputs[scope] = output_paths[scope]
+            write_step_log(
+                Path(args.log_dir) / f"stage2_v2_gate_{scope}.json",
+                f"stage2_v2_gate_{scope}",
+                analysis_started,
+                config,
+                args.seed_values,
+                "PASS",
+                {
+                    "gate_status": decision["gate_status"],
+                    "technical_status": decision["technical_status"],
+                    "group_numbers": scope_statistics[scope]["group_numbers"],
+                    "paired_tests": scope_statistics[scope]["paired_tests"],
+                    "manipulation_check": decision["manipulation_check"],
+                },
+                decision["conclusion"],
+            )
+        meta_decision = meta_gate_decision(scope_decisions)
         result = {
             "task": "stage2_gate_causal_v2",
             "status": "COMPLETE",
-            "gate_status": decision["gate_status"],
+            "gate_status": meta_decision["gate_status"],
+            "evidence_tier": meta_decision["evidence_tier"],
             "elapsed_sec": round(time.time() - started, 3),
             "config": config,
             "guardrails": {
@@ -2102,19 +2523,27 @@ def main() -> int:
                 "correlation_track_retained": True,
                 "stage3_requires_human_confirmation": True,
             },
-            "group_numbers": statistics["group_numbers"],
-            "paired_tests": statistics["paired_tests"],
+            "limitations": [
+                "The frozen causal feature map is defined only at the configured SAE layer.",
+                "Whole-model scope applies causal protection only to that layer's residual writers; "
+                "cross-layer causal saliency propagation is intentionally deferred.",
+                "No decoder direction is reused for downstream or neighboring layers.",
+            ],
+            "scope_statistics": scope_statistics,
+            "scope_decisions": scope_decisions,
+            "meta_decision": meta_decision,
+            "mask_diagnostics": intervention_diagnostics,
             "correlations": correlations,
             "sanity_check": sanity,
-            "decision": decision,
             "causal_summaries": causal_summaries,
             "intervention_summaries": intervention_summaries,
             "outputs": {
                 "model_csv": args.model_csv,
                 "example_csv": args.example_csv,
+                "scope_json": scope_outputs,
                 "json": args.out_json,
             },
-            "conclusion": decision["conclusion"],
+            "conclusion": meta_decision["conclusion"],
         }
         write_json(args.out_json, result)
         gate_log = Path(args.log_dir) / "stage2_v2_gate.json"
@@ -2126,12 +2555,13 @@ def main() -> int:
             args.seed_values,
             "PASS",
             {
-                "gate_status": decision["gate_status"],
-                "group_numbers": statistics["group_numbers"],
-                "paired_tests": statistics["paired_tests"],
+                "gate_status": meta_decision["gate_status"],
+                "evidence_tier": meta_decision["evidence_tier"],
+                "scope_statuses": meta_decision["scope_statuses"],
+                "scope_statistics": scope_statistics,
                 "sanity_conclusion": sanity["conclusion"],
             },
-            decision["conclusion"],
+            meta_decision["conclusion"],
         )
         write_step_log(
             master_log,
@@ -2141,25 +2571,38 @@ def main() -> int:
             args.seed_values,
             "PASS",
             {
-                "gate_status": decision["gate_status"],
+                "gate_status": meta_decision["gate_status"],
+                "evidence_tier": meta_decision["evidence_tier"],
                 "models": len(all_model_rows),
                 "paired_rows": len(all_example_rows),
             },
             "Stage 2 v2 completed and stopped at the mandatory human confirmation gate.",
         )
         print(f"wrote {args.out_json}")
-        print(f"gate_status: {decision['gate_status']}")
-        for target, numbers in statistics["group_numbers"].items():
+        print(f"gate_status: {meta_decision['gate_status']}")
+        print(f"evidence_tier: {meta_decision['evidence_tier']}")
+        for scope in enabled_scopes:
             print(
-                f"{target}: A={numbers['A_causal']:.4f} "
-                f"B={numbers['B_geometry']:.4f} C={numbers['C_random']:.4f}"
+                f"{scope}: {scope_decisions[scope]['gate_status']} "
+                f"({scope_decisions[scope]['technical_status']})"
             )
-        for name, test in statistics["paired_tests"].items():
-            print(
-                f"{name}: delta={test['mean_difference']:.4f} "
-                f"paired_bootstrap_p={test['bootstrap_p_two_sided']:.6g} "
-                f"holm_p={test['bootstrap_p_holm']:.6g}"
-            )
+            for target, metrics in scope_statistics[scope]["group_numbers"].items():
+                margin = metrics["margin"]
+                binary = metrics["binary"]
+                print(
+                    f"  {target} margin A={margin['A_causal']:.4f} "
+                    f"B={margin['B_geometry']:.4f} C={margin['C_random']:.4f}; "
+                    f"binary A={binary['A_causal']:.4f} "
+                    f"B={binary['B_geometry']:.4f} C={binary['C_random']:.4f}"
+                )
+            for name, test in scope_statistics[scope]["paired_tests"].items():
+                if "_A_vs_" not in name:
+                    continue
+                print(
+                    f"  {name}: delta={test['mean_difference']:.4f} "
+                    f"p={test['bootstrap_p_two_sided']:.6g} "
+                    f"holm_p={test.get('bootstrap_p_holm')}"
+                )
         print(f"sanity: {sanity['conclusion']}")
         print("STOP: human confirmation is required before Stage 3.")
         return 0
