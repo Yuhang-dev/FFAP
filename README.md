@@ -80,6 +80,13 @@ cd /root/autodl-tmp/ffap
 bash remote/run_stage1_capability_eval.sh
 ```
 
+Run the Stage 1 Wanda sparsity sweep:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/run_stage1_wanda_sweep.sh
+```
+
 Artifacts:
 
 ```text
@@ -89,10 +96,12 @@ logs/task0_smoke.json
 logs/stage1_smoke.json
 logs/stage1_magnitude_sweep.json
 logs/stage1_capability_eval.json
+logs/stage1_wanda_sweep.json
 results/task0_lm_eval/
 results/stage1_smoke.csv
 results/stage1_magnitude_sweep.csv
 results/stage1_capability_eval.csv
+results/stage1_wanda_sweep.csv
 ```
 
 ## Local Policy
