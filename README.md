@@ -30,11 +30,19 @@ cd /root/autodl-tmp/ffap
 bash remote/install_task0_deps.sh
 ```
 
-If PyTorch was downgraded on a Blackwell GPU, repair it with:
+If PyTorch was downgraded on a Blackwell GPU, repair it to the known-good
+Phase 1 target (`torch==2.12.0+cu130`) with:
 
 ```bash
 cd /root/autodl-tmp/ffap
 bash remote/repair_blackwell_torch.sh
+```
+
+Record the active environment fingerprint with:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/check_env_fingerprint.sh
 ```
 
 Prefetch Task 0 assets:

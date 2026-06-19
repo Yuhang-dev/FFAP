@@ -8,9 +8,12 @@ cd "$FFAP_ROOT"
 activate_pbp_if_needed
 configure_ffap_env
 
+export FFAP_TORCH_INDEX_URL="${FFAP_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu130}"
+export FFAP_TORCH_SPEC="${FFAP_TORCH_SPEC:-torch==2.12.0+cu130}"
+
 python -m pip uninstall -y torch torchvision torchaudio
-python -m pip install --pre torch \
-  --index-url https://download.pytorch.org/whl/nightly/cu128
+python -m pip install "$FFAP_TORCH_SPEC" \
+  --index-url "$FFAP_TORCH_INDEX_URL"
 python -m pip uninstall -y torchvision torchaudio
 
 python - <<'PY'
