@@ -94,6 +94,13 @@ cd /root/autodl-tmp/ffap
 bash remote/run_stage1_make_figures.sh
 ```
 
+Run the Stage 2 causal gate candidate:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/run_stage2_gate_causal.sh
+```
+
 Artifacts:
 
 ```text
@@ -111,6 +118,8 @@ results/stage1_capability_eval.csv
 results/stage1_wanda_sweep.csv
 results/stage1_pruning_comparison.csv
 figures/stage1_ppl_vs_featuredamage.png
+results/stage2_gate.json
+results/stage2_gate.csv
 ```
 
 ## Local Policy
