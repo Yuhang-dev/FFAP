@@ -32,7 +32,12 @@ configure_ffap_env() {
   export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-$HF_HOME/transformers}"
   export TORCH_HOME="${TORCH_HOME:-$DATA_DISK/torch_cache}"
   export HF_XET_CACHE="${HF_XET_CACHE:-$HF_HOME/xet}"
-  export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+  export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+  if [[ "$HF_HUB_DISABLE_XET" == "1" ]]; then
+    unset HF_XET_HIGH_PERFORMANCE
+  else
+    export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
+  fi
   export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-60}"
   export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$DATA_DISK/pip_cache}"
   export FFAP_PIP_INDEX_URL="${FFAP_PIP_INDEX_URL:-https://pypi.org/simple}"

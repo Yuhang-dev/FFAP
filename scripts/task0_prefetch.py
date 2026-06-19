@@ -38,13 +38,14 @@ def summarize_path(path: str | Path) -> dict[str, Any]:
     }
 
 
-def prefetch_model(model_id: str) -> dict[str, Any]:
+def prefetch_model(model_id: str, max_workers: int) -> dict[str, Any]:
     from huggingface_hub import snapshot_download
 
     started = time.time()
     kwargs: dict[str, Any] = {
         "repo_id": model_id,
         "allow_patterns": MODEL_ALLOW_PATTERNS,
+        "max_workers": max_workers,
     }
     if "resume_download" in inspect.signature(snapshot_download).parameters:
         kwargs["resume_download"] = True
@@ -53,6 +54,7 @@ def prefetch_model(model_id: str) -> dict[str, Any]:
         "repo_id": model_id,
         "local_path": path,
         "elapsed_sec": round(time.time() - started, 3),
+        "max_workers": max_workers,
         "summary": summarize_path(path),
     }
 
@@ -83,6 +85,7 @@ def main() -> int:
     parser.add_argument("--sae-id", default="layer_12/width_16k/canonical")
     parser.add_argument("--skip-model", action="store_true")
     parser.add_argument("--skip-sae", action="store_true")
+    parser.add_argument("--max-workers", type=int, default=1)
     parser.add_argument("--out", default="logs/task0_prefetch.json")
     args = parser.parse_args()
 
@@ -94,6 +97,7 @@ def main() -> int:
             "HF_HOME": os.environ.get("HF_HOME"),
             "HF_HUB_CACHE": os.environ.get("HF_HUB_CACHE"),
             "HF_DATASETS_CACHE": os.environ.get("HF_DATASETS_CACHE"),
+            "HF_HUB_DISABLE_XET": os.environ.get("HF_HUB_DISABLE_XET"),
         },
         "status": "STARTED",
     }
@@ -102,7 +106,9 @@ def main() -> int:
         if args.skip_model:
             payload["model"] = {"skipped": True}
         else:
-            payload["model"] = prefetch_model(args.model_id)
+            if args.max_workers < 1:
+                raise ValueError("--max-workers must be at least 1.")
+            payload["model"] = prefetch_model(args.model_id, args.max_workers)
 
         if args.skip_sae:
             payload["sae"] = {"skipped": True}
