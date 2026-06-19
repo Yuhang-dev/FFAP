@@ -23,6 +23,13 @@ cd /root/autodl-tmp/ffap
 bash remote/run_task0_preflight.sh
 ```
 
+Prefetch Task 0 assets:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/prefetch_task0_assets.sh
+```
+
 If CUDA is available, run the Task 0 smoke test:
 
 ```bash
@@ -34,6 +41,7 @@ Artifacts:
 
 ```text
 logs/task0_preflight.json
+logs/task0_prefetch.json
 logs/task0_smoke.json
 results/task0_lm_eval/
 ```

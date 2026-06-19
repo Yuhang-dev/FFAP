@@ -48,6 +48,13 @@ Do not run the full smoke test until `logs/task0_preflight.json` reports
 
 ## Smoke Command
 
+Prefetch required model/SAE assets first:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/prefetch_task0_assets.sh
+```
+
 ```bash
 cd /root/autodl-tmp/ffap
 bash remote/run_task0_smoke.sh
