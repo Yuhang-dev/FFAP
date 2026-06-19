@@ -94,12 +94,22 @@ cd /root/autodl-tmp/ffap
 bash remote/run_stage1_make_figures.sh
 ```
 
-Run the Stage 2 causal gate candidate:
+The original Stage 2 gate is frozen as `scripts/stage2_gate_causal_v1.py`.
+Run the task-matched correlation + A/B/C intervention gate with:
 
 ```bash
 cd /root/autodl-tmp/ffap
-bash remote/run_stage2_gate_causal.sh
+bash remote/run_stage2_gate_causal_v2.sh \
+  --step causal \
+  --advbench-path data/advbench/harmful_behaviors.csv
+
+bash remote/run_stage2_gate_causal_v2.sh \
+  --step intervention \
+  --advbench-path data/advbench/harmful_behaviors.csv
 ```
+
+See `docs/STAGE2_V2_REMOTE.md` for the smoke command and artifact layout. The
+v2 runner always stops at the Stage 2 human-confirmation gate.
 
 Artifacts:
 
@@ -120,6 +130,9 @@ results/stage1_pruning_comparison.csv
 figures/stage1_ppl_vs_featuredamage.png
 results/stage2_gate.json
 results/stage2_gate.csv
+results/stage2_gate_v2.json
+results/stage2_v2_models.csv
+results/stage2_v2_examples.csv
 ```
 
 ## Local Policy
