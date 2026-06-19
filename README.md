@@ -44,13 +44,22 @@ cd /root/autodl-tmp/ffap
 bash remote/run_task0_smoke.sh
 ```
 
+Run the first Stage 1 smoke experiment:
+
+```bash
+cd /root/autodl-tmp/ffap
+bash remote/run_stage1_smoke.sh
+```
+
 Artifacts:
 
 ```text
 logs/task0_preflight.json
 logs/task0_prefetch.json
 logs/task0_smoke.json
+logs/stage1_smoke.json
 results/task0_lm_eval/
+results/stage1_smoke.csv
 ```
 
 ## Local Policy

@@ -12,4 +12,4 @@ scipy
 torch
 tqdm
 transformers
-
+matplotlib

@@ -50,5 +50,5 @@ install_task0_deps() {
   python -m pip install \
     --index-url "$FFAP_PIP_INDEX_URL" \
     --cache-dir "$PIP_CACHE_DIR" \
-    einops scipy scikit-learn sae-lens lm-eval
+    einops scipy scikit-learn sae-lens lm-eval matplotlib
 }
