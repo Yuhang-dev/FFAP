@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 import time
 from pathlib import Path
@@ -41,11 +42,13 @@ def prefetch_model(model_id: str) -> dict[str, Any]:
     from huggingface_hub import snapshot_download
 
     started = time.time()
-    path = snapshot_download(
-        repo_id=model_id,
-        allow_patterns=MODEL_ALLOW_PATTERNS,
-        resume_download=True,
-    )
+    kwargs: dict[str, Any] = {
+        "repo_id": model_id,
+        "allow_patterns": MODEL_ALLOW_PATTERNS,
+    }
+    if "resume_download" in inspect.signature(snapshot_download).parameters:
+        kwargs["resume_download"] = True
+    path = snapshot_download(**kwargs)
     return {
         "repo_id": model_id,
         "local_path": path,
@@ -122,4 +125,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
