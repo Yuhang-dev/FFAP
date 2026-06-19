@@ -20,6 +20,19 @@ For FFAP, use a separate remote working directory:
 /root/autodl-tmp/ffap
 ```
 
+Optional `.bashrc` helper matching the existing AAP/PBP setup:
+
+```bash
+export FFAP_ROOT=$DATA_DISK/ffap
+
+ffapenv() {
+  cd "$FFAP_ROOT"
+  source /etc/network_turbo
+  conda activate pbp
+  export PYTHONPATH="$FFAP_ROOT:${PYTHONPATH:-}"
+}
+```
+
 ## Current Blocker
 
 The handoff recorded `torch.cuda.is_available: False` and empty GPU sections.
@@ -54,4 +67,3 @@ Task 0 is complete only when `logs/task0_smoke.json` contains:
 - dense forward elapsed time
 - SAE reconstruction MSE and L0
 - ARC-Easy small-subset baseline from `lm-eval`
-

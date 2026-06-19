@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /root/autodl-tmp/ffap
-source /root/autodl-tmp/ffap/remote/common.sh
+FFAP_ROOT="${FFAP_ROOT:-${DATA_DISK:-/root/autodl-tmp}/ffap}"
+source "$FFAP_ROOT/remote/common.sh"
+resolve_ffap_root
+cd "$FFAP_ROOT"
 activate_pbp_if_needed
 configure_ffap_env
 
 python -m pip install -e . --no-build-isolation
-

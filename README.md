@@ -13,7 +13,7 @@ Do not proceed past the Stage 2 gate without human confirmation.
 Expected remote working directory:
 
 ```bash
-/root/autodl-tmp/ffap
+${FFAP_ROOT:-/root/autodl-tmp/ffap}
 ```
 
 Run the environment preflight first:
@@ -48,4 +48,3 @@ Allowed local check:
 ```bash
 python -m compileall ffap scripts
 ```
-

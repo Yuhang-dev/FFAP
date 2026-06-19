@@ -18,8 +18,14 @@ activate_pbp_if_needed() {
   conda activate pbp
 }
 
+resolve_ffap_root() {
+  export DATA_DISK="${DATA_DISK:-/root/autodl-tmp}"
+  export FFAP_ROOT="${FFAP_ROOT:-$DATA_DISK/ffap}"
+}
+
 configure_ffap_env() {
   export DATA_DISK="${DATA_DISK:-/root/autodl-tmp}"
+  export FFAP_ROOT="${FFAP_ROOT:-$DATA_DISK/ffap}"
   export HF_HOME="${HF_HOME:-$DATA_DISK/hf_cache}"
   export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
   export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
@@ -31,4 +37,3 @@ configure_ffap_env() {
   export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$DATA_DISK/pip_cache}"
   export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 }
-
