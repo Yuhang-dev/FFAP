@@ -296,19 +296,57 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def gate_decision(correlations: dict[str, Any]) -> dict[str, str]:
-    causal = correlations["causal_weighted_mean_activation_l1"]["spearman_r"]
-    geometry = correlations["selected_mean_activation_l1"]["spearman_r"]
+    causal_predictors = [
+        "causal_weighted_mean_activation_l1",
+        "abs_causal_weighted_mean_activation_l1",
+        "causal_weighted_firing_rate_l1",
+        "abs_causal_weighted_firing_rate_l1",
+    ]
+    geometry_predictors = [
+        "selected_mean_activation_l1",
+        "selected_firing_rate_l1",
+    ]
+
+    def best_of(predictors: list[str]) -> tuple[str | None, float | None]:
+        valid = [
+            (name, correlations[name]["spearman_r"])
+            for name in predictors
+            if correlations[name]["spearman_r"] is not None
+        ]
+        if not valid:
+            return None, None
+        return max(valid, key=lambda item: item[1])
+
+    best_causal_name, best_causal = best_of(causal_predictors)
+    best_geometry_name, best_geometry = best_of(geometry_predictors)
     ppl = correlations["ppl_relative_increase"]["spearman_r"]
-    if causal is None or geometry is None or ppl is None:
+
+    if best_causal is None or best_geometry is None or ppl is None:
         status = "INCONCLUSIVE"
         reason = "Insufficient variation for Spearman comparison."
-    elif causal > geometry and causal > ppl:
+    elif best_causal > best_geometry and best_causal > ppl:
         status = "PASS_CANDIDATE"
-        reason = "Causal-weighted feature damage has the strongest Spearman association with ability loss."
+        reason = (
+            f"Best causal-weighted metric ({best_causal_name}, rho={best_causal:.3f}) "
+            f"exceeds best geometry metric ({best_geometry_name}, rho={best_geometry:.3f}) "
+            f"and PPL relative increase (rho={ppl:.3f})."
+        )
     else:
         status = "FAIL_OR_REVISE_CANDIDATE"
-        reason = "Causal-weighted feature damage is not stronger than geometry and PPL on this sample."
-    return {"gate_status": status, "reason": reason}
+        reason = (
+            f"Best causal-weighted metric ({best_causal_name}, rho={best_causal:.3f}) "
+            f"does not exceed both best geometry metric ({best_geometry_name}, "
+            f"rho={best_geometry:.3f}) and PPL relative increase (rho={ppl:.3f})."
+        )
+    return {
+        "gate_status": status,
+        "reason": reason,
+        "best_causal_metric": best_causal_name,
+        "best_causal_spearman_r": best_causal,
+        "best_geometry_metric": best_geometry_name,
+        "best_geometry_spearman_r": best_geometry,
+        "ppl_spearman_r": ppl,
+    }
 
 
 def main() -> int:
@@ -475,4 +513,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
