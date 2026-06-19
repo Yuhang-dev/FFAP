@@ -9,9 +9,9 @@ activate_pbp_if_needed
 configure_ffap_env
 
 python -m pip uninstall -y torch torchvision torchaudio
-python -m pip install --pre torch torchvision \
+python -m pip install --pre torch \
   --index-url https://download.pytorch.org/whl/nightly/cu128
-python -m pip uninstall -y torchaudio
+python -m pip uninstall -y torchvision torchaudio
 
 python - <<'PY'
 import torch
@@ -24,4 +24,3 @@ print("capability", torch.cuda.get_device_capability(0))
 x = torch.ones(1, device="cuda")
 print("kernel_ok", (x + 1).item())
 PY
-
