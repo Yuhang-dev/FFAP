@@ -18,7 +18,13 @@ def _json_safe(value: Any) -> Any:
 
 def cfg_value(sae: Any, name: str, default: Any = None) -> Any:
     cfg = getattr(sae, "cfg", None)
-    return _json_safe(getattr(cfg, name, default))
+    if cfg is None:
+        return _json_safe(default)
+    value = getattr(cfg, name, default)
+    if value is not default and value is not None:
+        return _json_safe(value)
+    metadata = getattr(cfg, "metadata", None)
+    return _json_safe(getattr(metadata, name, default))
 
 
 def _call_norm_in(sae: Any, value: Any) -> tuple[Any, tuple[Any, ...]]:
@@ -58,6 +64,10 @@ def sae_runtime_summary(sae: Any) -> dict[str, Any]:
         "apply_b_dec_to_input": cfg_value(sae, "apply_b_dec_to_input"),
         "hook_name": cfg_value(sae, "hook_name"),
         "hook_layer": cfg_value(sae, "hook_layer"),
+        "model_name": cfg_value(sae, "model_name"),
+        "prepend_bos": cfg_value(sae, "prepend_bos"),
+        "seqpos_slice": cfg_value(sae, "seqpos_slice"),
+        "model_from_pretrained_kwargs": cfg_value(sae, "model_from_pretrained_kwargs", {}),
         "architecture": cfg_value(sae, "architecture"),
         "d_in": cfg_value(sae, "d_in"),
         "d_sae": cfg_value(sae, "d_sae"),

@@ -40,6 +40,7 @@ def collect_prompt_hidden(
     batch_size: int,
     device: str,
     use_chat_template: bool,
+    hook_point: str = "post",
 ) -> torch.Tensor:
     captured: list[torch.Tensor] = []
 
@@ -47,7 +48,16 @@ def collect_prompt_hidden(
         hidden = output[0] if isinstance(output, tuple) else output
         captured.append(hidden.detach())
 
-    handle = model.model.layers[layer].register_forward_hook(hook)
+    def pre_hook(_module: Any, inputs: Any) -> None:
+        hidden = inputs[0] if isinstance(inputs, tuple) else inputs
+        captured.append(hidden.detach())
+
+    if hook_point == "post":
+        handle = model.model.layers[layer].register_forward_hook(hook)
+    elif hook_point == "pre":
+        handle = model.model.layers[layer].register_forward_pre_hook(pre_hook)
+    else:
+        raise ValueError(f"Unknown hook point: {hook_point}")
     output_rows = []
     original_side = tokenizer.padding_side
     tokenizer.padding_side = "right"
@@ -89,6 +99,7 @@ def collect_token_hidden(
     batch_size: int,
     device: str,
     token_limit: int,
+    hook_point: str = "post",
 ) -> torch.Tensor:
     captured: list[torch.Tensor] = []
 
@@ -96,7 +107,16 @@ def collect_token_hidden(
         hidden = output[0] if isinstance(output, tuple) else output
         captured.append(hidden.detach())
 
-    handle = model.model.layers[layer].register_forward_hook(hook)
+    def pre_hook(_module: Any, inputs: Any) -> None:
+        hidden = inputs[0] if isinstance(inputs, tuple) else inputs
+        captured.append(hidden.detach())
+
+    if hook_point == "post":
+        handle = model.model.layers[layer].register_forward_hook(hook)
+    elif hook_point == "pre":
+        handle = model.model.layers[layer].register_forward_pre_hook(pre_hook)
+    else:
+        raise ValueError(f"Unknown hook point: {hook_point}")
     output_rows = []
     original_side = tokenizer.padding_side
     tokenizer.padding_side = "right"
@@ -132,21 +152,26 @@ def collect_token_hidden(
     return torch.cat(output_rows, dim=0)
 
 
-@torch.no_grad()
-def feature_metrics(sae: Any, hidden: torch.Tensor, device: str, label: str) -> dict[str, Any]:
-    hidden_device = hidden.to(device)
-    features = sae.encode(hidden_device).float()
-    reconstruction = sae.decode(features).float()
-    error = hidden_device.float() - reconstruction
-    centered = hidden_device.float() - hidden_device.float().mean(dim=0, keepdim=True)
-    explained_variance = 1.0 - float(error.square().sum() / centered.square().sum().clamp_min(1e-12))
-    cosine = F.cosine_similarity(hidden_device.float(), reconstruction, dim=-1)
+def _scalar_reconstruction_metrics(
+    hidden_float: torch.Tensor,
+    features: torch.Tensor,
+    reconstruction: torch.Tensor,
+    label: str,
+) -> dict[str, Any]:
+    error = hidden_float - reconstruction
+    centered = hidden_float - hidden_float.mean(dim=0, keepdim=True)
+    variance_denominator = centered.square().sum().clamp_min(1e-12)
+    explained_variance = 1.0 - float(error.square().sum() / variance_denominator)
+    cosine = F.cosine_similarity(hidden_float, reconstruction, dim=-1)
     firing = features > 0
+    hidden_norm = hidden_float.norm(dim=-1)
+    reconstruction_norm = reconstruction.norm(dim=-1)
+    optimal_scale = float(
+        (hidden_float * reconstruction).sum() / reconstruction.square().sum().clamp_min(1e-12)
+    )
+    scaled_error = hidden_float - optimal_scale * reconstruction
+    optimal_scaled_ev = 1.0 - float(scaled_error.square().sum() / variance_denominator)
     return {
-        "mean": features.mean(dim=0).cpu(),
-        "firing_rate": firing.float().mean(dim=0).cpu(),
-        "activity_mass": (features.mean(dim=0) * firing.float().mean(dim=0)).cpu(),
-        "pool": features.detach().cpu().to(torch.float16),
         "explained_variance": explained_variance,
         "decoded_cosine": float(cosine.mean()),
         "reconstruction_mse": float(error.square().mean()),
@@ -154,11 +179,59 @@ def feature_metrics(sae: Any, hidden: torch.Tensor, device: str, label: str) -> 
         "dead_feature_rate": float((firing.sum(dim=0) == 0).float().mean()),
         "tokens": int(features.shape[0]),
         "metric_scope": label,
+        "hidden_norm_mean": float(hidden_norm.mean()),
+        "reconstruction_norm_mean": float(reconstruction_norm.mean()),
+        "reconstruction_to_hidden_norm": float(
+            reconstruction_norm.mean() / hidden_norm.mean().clamp_min(1e-12)
+        ),
+        "optimal_reconstruction_scale": optimal_scale,
+        "optimal_scaled_explained_variance": optimal_scaled_ev,
+    }
+
+
+@torch.no_grad()
+def feature_metrics(sae: Any, hidden: torch.Tensor, device: str, label: str) -> dict[str, Any]:
+    hidden_device = hidden.to(device)
+    hidden_float = hidden_device.float()
+    features = sae.encode(hidden_device).float()
+    reconstruction = sae.decode(features).float()
+    firing = features > 0
+    return {
+        "mean": features.mean(dim=0).cpu(),
+        "firing_rate": firing.float().mean(dim=0).cpu(),
+        "activity_mass": (features.mean(dim=0) * firing.float().mean(dim=0)).cpu(),
+        "pool": features.detach().cpu().to(torch.float16),
+        **_scalar_reconstruction_metrics(hidden_float, features, reconstruction, label),
     }
 
 
 def prompt_feature_metrics(sae: Any, hidden: torch.Tensor, device: str) -> dict[str, Any]:
     return feature_metrics(sae, hidden, device, "prompt_final")
+
+
+@torch.no_grad()
+def feature_scale_scan(
+    sae: Any,
+    hidden: torch.Tensor,
+    device: str,
+    scales: Iterable[float],
+    label: str,
+) -> list[dict[str, Any]]:
+    hidden_device = hidden.to(device).float()
+    rows = []
+    for scale in scales:
+        if scale <= 0:
+            raise ValueError(f"Scale must be positive, got {scale}.")
+        scaled_hidden = hidden_device * float(scale)
+        features = sae.encode(scaled_hidden).float()
+        scaled_reconstruction = sae.decode(features).float()
+        reconstruction = scaled_reconstruction / float(scale)
+        row = _scalar_reconstruction_metrics(
+            hidden_device, features, reconstruction, f"{label}_scale_{scale:g}"
+        )
+        row["input_scale"] = float(scale)
+        rows.append(row)
+    return rows
 
 
 def _compatibility_texts(

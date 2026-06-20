@@ -12,6 +12,7 @@ from ffap.stage2_v3.causal import (
     _compatibility_texts,
     collect_prompt_hidden,
     collect_token_hidden,
+    feature_scale_scan,
     feature_metrics,
     layer_from_sae_id,
 )
@@ -55,6 +56,11 @@ def _metric_subset(metrics: dict[str, Any]) -> dict[str, Any]:
             "reconstruction_mse",
             "l0",
             "dead_feature_rate",
+            "hidden_norm_mean",
+            "reconstruction_norm_mean",
+            "reconstruction_to_hidden_norm",
+            "optimal_reconstruction_scale",
+            "optimal_scaled_explained_variance",
         }
     }
 
@@ -72,6 +78,10 @@ def _load_sae(release: str, sae_id: str, device: str, wrapped: bool) -> tuple[An
     }
 
 
+def _floats(raw: str) -> tuple[float, ...]:
+    return tuple(float(item.strip()) for item in raw.split(",") if item.strip())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 2 v3 R0 SAE diagnostic")
     parser.add_argument("--model-id", default="google/gemma-2-9b-it")
@@ -84,6 +94,8 @@ def main() -> int:
     parser.add_argument("--batch-examples", type=int, default=2)
     parser.add_argument("--compatibility-text-limit", type=int, default=256)
     parser.add_argument("--compatibility-token-limit", type=int, default=8192)
+    parser.add_argument("--hook-points", default="post,pre")
+    parser.add_argument("--scale-scan", default="0.125,0.25,0.333333,0.5,0.75,1.0,1.5,2.0")
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
 
@@ -115,57 +127,72 @@ def main() -> int:
     rows = []
     for sae_id in _strings(args.sae_ids):
         layer = layer_from_sae_id(sae_id)
-        prompt_hidden = collect_prompt_hidden(
-            model,
-            tokenizer,
-            [item.prompt for item in harmful + benign],
-            layer,
-            args.max_length,
-            args.batch_examples,
-            args.device,
-            True,
-        )
-        token_hidden = collect_token_hidden(
-            model,
-            tokenizer,
-            _compatibility_texts(tokenizer, manifest, harmful, benign, config),
-            layer,
-            args.max_length,
-            args.batch_examples,
-            args.device,
-            args.compatibility_token_limit,
-        )
-        for mode, wrapped in (("raw", False), ("wrapped", True)):
-            sae, metadata = _load_sae(args.sae_release, sae_id, args.device, wrapped)
-            try:
-                token_metrics = feature_metrics(sae, token_hidden, args.device, "token_level")
-                prompt_metrics = feature_metrics(sae, prompt_hidden, args.device, "prompt_final")
-                rows.append(
-                    {
-                        "layer": layer,
-                        "sae_id": sae_id,
-                        "mode": mode,
-                        "sae_metadata": metadata,
-                        "token_level": _metric_subset(token_metrics),
-                        "prompt_final": _metric_subset(prompt_metrics),
-                        "status": "PASS",
-                    }
-                )
-            except Exception as error:
-                rows.append(
-                    {
-                        "layer": layer,
-                        "sae_id": sae_id,
-                        "mode": mode,
-                        "sae_metadata": metadata,
-                        "status": "FAIL",
-                        "error": {"type": type(error).__name__, "message": str(error)},
-                    }
-                )
-            finally:
-                del sae
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+        for hook_point in _strings(args.hook_points):
+            prompt_hidden = collect_prompt_hidden(
+                model,
+                tokenizer,
+                [item.prompt for item in harmful + benign],
+                layer,
+                args.max_length,
+                args.batch_examples,
+                args.device,
+                True,
+                hook_point=hook_point,
+            )
+            token_hidden = collect_token_hidden(
+                model,
+                tokenizer,
+                _compatibility_texts(tokenizer, manifest, harmful, benign, config),
+                layer,
+                args.max_length,
+                args.batch_examples,
+                args.device,
+                args.compatibility_token_limit,
+                hook_point=hook_point,
+            )
+            for mode, wrapped in (("raw", False), ("wrapped", True)):
+                sae, metadata = _load_sae(args.sae_release, sae_id, args.device, wrapped)
+                try:
+                    token_metrics = feature_metrics(sae, token_hidden, args.device, "token_level")
+                    prompt_metrics = feature_metrics(sae, prompt_hidden, args.device, "prompt_final")
+                    rows.append(
+                        {
+                            "layer": layer,
+                            "sae_id": sae_id,
+                            "hook_point": hook_point,
+                            "mode": mode,
+                            "sae_metadata": metadata,
+                            "token_level": _metric_subset(token_metrics),
+                            "prompt_final": _metric_subset(prompt_metrics),
+                            "token_level_scale_scan": [
+                                _metric_subset(row) | {"input_scale": row["input_scale"]}
+                                for row in feature_scale_scan(
+                                    sae,
+                                    token_hidden,
+                                    args.device,
+                                    _floats(args.scale_scan),
+                                    f"{hook_point}_token_level",
+                                )
+                            ],
+                            "status": "PASS",
+                        }
+                    )
+                except Exception as error:
+                    rows.append(
+                        {
+                            "layer": layer,
+                            "sae_id": sae_id,
+                            "hook_point": hook_point,
+                            "mode": mode,
+                            "sae_metadata": metadata,
+                            "status": "FAIL",
+                            "error": {"type": type(error).__name__, "message": str(error)},
+                        }
+                    )
+                finally:
+                    del sae
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
     result = {
         "step": "stage2_v3_r0_diagnostic",
@@ -174,7 +201,10 @@ def main() -> int:
         "config": vars(args),
         "torch": _gpu_summary(),
         "rows": rows,
-        "conclusion": "Compare raw vs wrapped token-level EV/L0/dead-rate before deciding whether to enable the wrapper.",
+        "conclusion": (
+            "Compare raw vs wrapped, pre vs post hook points, and input-scale scans "
+            "before deciding whether the failure is normalization, hook alignment, or SAE transfer."
+        ),
     }
     write_json(args.out, result)
     print(f"wrote {args.out}")
