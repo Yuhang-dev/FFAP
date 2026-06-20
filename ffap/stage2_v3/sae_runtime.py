@@ -3,9 +3,22 @@ from __future__ import annotations
 from typing import Any
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if callable(value):
+        name = getattr(value, "__qualname__", getattr(value, "__name__", type(value).__name__))
+        return f"<callable:{name}>"
+    return str(value)
+
+
 def cfg_value(sae: Any, name: str, default: Any = None) -> Any:
     cfg = getattr(sae, "cfg", None)
-    return getattr(cfg, name, default)
+    return _json_safe(getattr(cfg, name, default))
 
 
 def _call_norm_in(sae: Any, value: Any) -> tuple[Any, tuple[Any, ...]]:

@@ -13,7 +13,7 @@ from ffap.stage2_v3.config import INTERVENTION_ARMS, Stage2V3Config
 from ffap.stage2_v3.data import _assert_disjoint, stable_id
 from ffap.stage2_v3.judge import cache_key, judge_rows, parse_judge_payload
 from ffap.stage2_v3.pipeline import _multiarm_mask_diagnostics, gate_decision
-from ffap.stage2_v3.sae_runtime import ensure_sae_runtime_normalization
+from ffap.stage2_v3.sae_runtime import ensure_sae_runtime_normalization, sae_runtime_summary
 from ffap.stage2_v3.statistics import paired_hierarchical_bootstrap
 
 
@@ -122,6 +122,13 @@ class Stage2V3Tests(unittest.TestCase):
         self.assertEqual(sae.out_calls, 1)
         torch.testing.assert_close(features, torch.full((2, 2), 3.0))
         torch.testing.assert_close(reconstructed, x)
+
+    def test_sae_runtime_summary_is_json_safe(self):
+        sae = FakeNormSAE()
+        sae.cfg.normalize_activations = lambda x: x
+        payload = sae_runtime_summary(sae)
+        json.dumps(payload)
+        self.assertIn("<callable:", payload["normalize_activations"])
 
     def test_multiarm_masks_have_equal_budget_and_contrast(self):
         masks = {}
