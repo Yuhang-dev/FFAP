@@ -16,6 +16,7 @@ dependencies = [
   "lm-eval",
   "matplotlib",
   "numpy",
+  "openai",
   "pyyaml",
   "safetensors",
   "sae-lens",
