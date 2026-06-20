@@ -13,6 +13,7 @@ from ffap.stage2_v3.config import INTERVENTION_ARMS, Stage2V3Config
 from ffap.stage2_v3.data import _assert_disjoint, stable_id
 from ffap.stage2_v3.judge import cache_key, judge_rows, parse_judge_payload
 from ffap.stage2_v3.pipeline import _multiarm_mask_diagnostics, gate_decision
+from ffap.stage2_v3.sae_runtime import ensure_sae_runtime_normalization
 from ffap.stage2_v3.statistics import paired_hierarchical_bootstrap
 
 
@@ -37,6 +38,32 @@ class FakeCompletions:
 class FakeClient:
     def __init__(self) -> None:
         self.chat = SimpleNamespace(completions=FakeCompletions())
+
+
+class FakeNormSAE:
+    def __init__(self) -> None:
+        self.cfg = SimpleNamespace(
+            normalize_activations="constant_norm_rescale",
+            apply_b_dec_to_input=False,
+            d_in=2,
+            d_sae=2,
+        )
+        self.in_calls = 0
+        self.out_calls = 0
+
+    def run_time_activation_norm_fn_in(self, value):
+        self.in_calls += 1
+        return value * 2
+
+    def run_time_activation_norm_fn_out(self, value, _original):
+        self.out_calls += 1
+        return value / 2
+
+    def encode(self, value):
+        return value + 1
+
+    def decode(self, features):
+        return features - 1
 
 
 class Stage2V3Tests(unittest.TestCase):
@@ -83,6 +110,18 @@ class Stage2V3Tests(unittest.TestCase):
             cache_key(config, "harmful", "p", "a"),
             cache_key(config, "harmful", "p", "b"),
         )
+
+    def test_sae_runtime_wrapper_applies_in_and_out_norm(self):
+        sae = FakeNormSAE()
+        summary = ensure_sae_runtime_normalization(sae)
+        x = torch.ones(2, 2)
+        features = sae.encode(x)
+        reconstructed = sae.decode(features)
+        self.assertTrue(summary["wrapped"])
+        self.assertEqual(sae.in_calls, 1)
+        self.assertEqual(sae.out_calls, 1)
+        torch.testing.assert_close(features, torch.full((2, 2), 3.0))
+        torch.testing.assert_close(reconstructed, x)
 
     def test_multiarm_masks_have_equal_budget_and_contrast(self):
         masks = {}

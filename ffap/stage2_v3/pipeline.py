@@ -27,6 +27,7 @@ from .config import INTERVENTION_ARMS, Stage2V3Config
 from .data import PromptExample, ability_examples, prepare_splits, prompt_examples
 from .judge import judge_rows
 from .legacy import v2
+from .sae_runtime import ensure_sae_runtime_normalization
 from .statistics import (
     apply_holm,
     is_noninferior,
@@ -194,6 +195,10 @@ def causal(config: Stage2V3Config, device: str) -> dict[str, Any]:
         v2.set_pad_token(tokenizer)
         model = v2.load_model(config.model_id, device)
         sae, sae_metadata = v2.load_sae_compat(config.sae_release, sae_id, device)
+        sae_metadata = {
+            **sae_metadata,
+            "runtime_normalization": ensure_sae_runtime_normalization(sae),
+        }
         v2.freeze_sae(sae)
         ability_calibration = ability_examples(manifest, "calibration")
         ability_dev = ability_examples(manifest, "dev")[: config.ablation_eval_limit]
@@ -467,6 +472,7 @@ def intervention(config: Stage2V3Config, device: str) -> dict[str, Any]:
         )
         dense = v2.load_model(config.model_id, device)
         sae, _ = v2.load_sae_compat(config.sae_release, sae_id, device)
+        ensure_sae_runtime_normalization(sae)
         v2.freeze_sae(sae)
         input_stats = v2.collect_wanda_input_stats(dense, calibration_blocks)
         writer_names = v2.writer_module_names(dense, layer)

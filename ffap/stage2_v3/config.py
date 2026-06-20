@@ -98,6 +98,9 @@ class Stage2V3Config:
     ppl_blocks: int = 16
     calib_seq_len: int = 128
     calib_blocks: int = 32
+    compatibility_text_limit: int = 256
+    compatibility_max_length: int = 256
+    compatibility_token_limit: int = 8192
     use_chat_template: bool = True
     output_root: Path = Path("results/stage2_v3")
     log_root: Path = Path("logs")
@@ -146,4 +149,3 @@ class Stage2V3Config:
 
     def artifact_path(self, seed: int) -> Path:
         return self.output_root / "artifacts" / f"causal_seed{seed}.pt"
-

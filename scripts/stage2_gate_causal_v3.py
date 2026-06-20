@@ -59,6 +59,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--protect-fraction", type=float, default=0.02)
     result.add_argument("--causal-top-fraction", type=float, default=0.05)
     result.add_argument("--causal-sharpen-power", type=float, default=2.0)
+    result.add_argument("--compatibility-text-limit", type=int, default=256)
+    result.add_argument("--compatibility-max-length", type=int, default=256)
+    result.add_argument("--compatibility-token-limit", type=int, default=8192)
     result.add_argument("--bootstrap-samples", type=int, default=10000)
     result.add_argument("--judge-base-url", default="https://api.deepseek.com")
     result.add_argument("--judge-model", default="deepseek-v4-flash")
@@ -101,6 +104,9 @@ def config_from_args(args: argparse.Namespace) -> Stage2V3Config:
         protect_fraction=args.protect_fraction,
         causal_top_fraction=args.causal_top_fraction,
         causal_sharpen_power=args.causal_sharpen_power,
+        compatibility_text_limit=args.compatibility_text_limit,
+        compatibility_max_length=args.compatibility_max_length,
+        compatibility_token_limit=args.compatibility_token_limit,
         bootstrap_samples=args.bootstrap_samples,
         judge_base_url=args.judge_base_url,
         judge_model=args.judge_model,
@@ -127,6 +133,8 @@ def config_from_args(args: argparse.Namespace) -> Stage2V3Config:
         config.ppl_blocks = 2
         config.validation_features_per_tail = 1
         config.ablation_eval_limit = 4
+        config.compatibility_text_limit = min(config.compatibility_text_limit, 16)
+        config.compatibility_token_limit = min(config.compatibility_token_limit, 1024)
         config.bootstrap_samples = 500
         config.manual_sample_size = 12
         config.output_root = Path("results/stage2_v3_smoke")

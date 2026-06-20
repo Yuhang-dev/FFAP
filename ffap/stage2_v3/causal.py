@@ -14,6 +14,7 @@ from .config import CANONICAL_L0, Stage2V3Config
 from .data import PromptExample
 from .judge import keyword_refusal
 from .legacy import task_gate, v2
+from .sae_runtime import ensure_sae_runtime_normalization
 
 
 def layer_from_sae_id(sae_id: str) -> int:
@@ -79,7 +80,60 @@ def collect_prompt_hidden(
 
 
 @torch.no_grad()
-def prompt_feature_metrics(sae: Any, hidden: torch.Tensor, device: str) -> dict[str, Any]:
+def collect_token_hidden(
+    model: Any,
+    tokenizer: Any,
+    texts: list[str],
+    layer: int,
+    max_length: int,
+    batch_size: int,
+    device: str,
+    token_limit: int,
+) -> torch.Tensor:
+    captured: list[torch.Tensor] = []
+
+    def hook(_module: Any, _inputs: Any, output: Any) -> None:
+        hidden = output[0] if isinstance(output, tuple) else output
+        captured.append(hidden.detach())
+
+    handle = model.model.layers[layer].register_forward_hook(hook)
+    output_rows = []
+    original_side = tokenizer.padding_side
+    tokenizer.padding_side = "right"
+    total = 0
+    try:
+        for start in range(0, len(texts), batch_size):
+            encoded = tokenizer(
+                texts[start : start + batch_size],
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+            ).to(device)
+            captured.clear()
+            model(**encoded, use_cache=False)
+            hidden = captured[-1]
+            valid = encoded.attention_mask.bool()
+            flat = hidden[valid].float().cpu()
+            if token_limit > 0:
+                remaining = token_limit - total
+                if remaining <= 0:
+                    break
+                flat = flat[:remaining]
+            output_rows.append(flat)
+            total += flat.shape[0]
+            if token_limit > 0 and total >= token_limit:
+                break
+    finally:
+        tokenizer.padding_side = original_side
+        handle.remove()
+    if not output_rows:
+        raise RuntimeError("No token activations were captured.")
+    return torch.cat(output_rows, dim=0)
+
+
+@torch.no_grad()
+def feature_metrics(sae: Any, hidden: torch.Tensor, device: str, label: str) -> dict[str, Any]:
     hidden_device = hidden.to(device)
     features = sae.encode(hidden_device).float()
     reconstruction = sae.decode(features).float()
@@ -99,7 +153,32 @@ def prompt_feature_metrics(sae: Any, hidden: torch.Tensor, device: str) -> dict[
         "l0": float(firing.sum(dim=-1).float().mean()),
         "dead_feature_rate": float((firing.sum(dim=0) == 0).float().mean()),
         "tokens": int(features.shape[0]),
+        "metric_scope": label,
     }
+
+
+def prompt_feature_metrics(sae: Any, hidden: torch.Tensor, device: str) -> dict[str, Any]:
+    return feature_metrics(sae, hidden, device, "prompt_final")
+
+
+def _compatibility_texts(
+    tokenizer: Any,
+    manifest: dict[str, Any],
+    harmful: list[PromptExample],
+    benign: list[PromptExample],
+    config: Stage2V3Config,
+) -> list[str]:
+    texts = []
+    for task in manifest["ability"].values():
+        for row in task["calibration"]:
+            prompt = _prompt_text(tokenizer, row["prompt"], config.use_chat_template)
+            texts.append(prompt + row["choices"][int(row["gold"])])
+    texts.extend(_prompt_text(tokenizer, item.prompt, config.use_chat_template) for item in harmful)
+    texts.extend(_prompt_text(tokenizer, item.prompt, config.use_chat_template) for item in benign)
+    rng = np.random.default_rng(config.split_seed)
+    indices = rng.permutation(len(texts))
+    limit = min(len(texts), config.compatibility_text_limit)
+    return [texts[int(index)] for index in indices[:limit]]
 
 
 def extract_refusal_direction(harmful: torch.Tensor, benign: torch.Tensor) -> torch.Tensor:
@@ -258,6 +337,7 @@ def run_layer_scan(
     for sae_id in config.sae_ids:
         layer = layer_from_sae_id(sae_id)
         sae, _metadata = v2.load_sae_compat(config.sae_release, sae_id, device)
+        runtime_norm = ensure_sae_runtime_normalization(sae)
         v2.freeze_sae(sae)
         harmful_hidden = collect_prompt_hidden(
             model, tokenizer, [item.prompt for item in harmful_calibration], layer,
@@ -267,7 +347,18 @@ def run_layer_scan(
             model, tokenizer, [item.prompt for item in benign_calibration], layer,
             config.max_length, config.batch_examples, device, config.use_chat_template,
         )
-        metrics = prompt_feature_metrics(sae, torch.cat((harmful_hidden, benign_hidden)), device)
+        prompt_metrics = prompt_feature_metrics(sae, torch.cat((harmful_hidden, benign_hidden)), device)
+        token_hidden = collect_token_hidden(
+            model,
+            tokenizer,
+            _compatibility_texts(tokenizer, manifest, harmful_calibration, benign_calibration, config),
+            layer,
+            config.compatibility_max_length,
+            config.batch_examples,
+            device,
+            config.compatibility_token_limit,
+        )
+        compatibility_metrics = feature_metrics(sae, token_hidden, device, "token_level")
         direction = extract_refusal_direction(harmful_hidden, benign_hidden)
         directions[layer] = direction
         harmful_projection = harmful_hidden @ direction
@@ -284,10 +375,10 @@ def run_layer_scan(
         harmful_effect = direction_effect(harmful_base, harmful_subtract, config.split_seed + layer)
         benign_effect = direction_effect(benign_base, benign_add, config.split_seed + 100 + layer)
         canonical_l0 = CANONICAL_L0[layer]
-        l0_ratio = metrics["l0"] / canonical_l0
+        l0_ratio = compatibility_metrics["l0"] / canonical_l0
         compatibility_pass = (
-            metrics["decoded_cosine"] >= config.sae_cosine_min
-            and metrics["explained_variance"] >= config.sae_explained_variance_min
+            compatibility_metrics["decoded_cosine"] >= config.sae_cosine_min
+            and compatibility_metrics["explained_variance"] >= config.sae_explained_variance_min
         )
         mediation_pass = harmful_effect["ci95"][1] < 0 and benign_effect["ci95"][0] > 0
         warnings = []
@@ -298,8 +389,26 @@ def run_layer_scan(
             {
                 "layer": layer,
                 "sae_id": sae_id,
-                "sae_metadata": {"release": config.sae_release, "sae_id": sae_id},
-                "metrics": {key: value for key, value in metrics.items() if not isinstance(value, torch.Tensor)},
+                "sae_metadata": {
+                    "release": config.sae_release,
+                    "sae_id": sae_id,
+                    "runtime_normalization": runtime_norm,
+                },
+                "metrics": {
+                    key: value
+                    for key, value in compatibility_metrics.items()
+                    if not isinstance(value, torch.Tensor)
+                },
+                "compatibility_metrics": {
+                    key: value
+                    for key, value in compatibility_metrics.items()
+                    if not isinstance(value, torch.Tensor)
+                },
+                "prompt_final_metrics": {
+                    key: value
+                    for key, value in prompt_metrics.items()
+                    if not isinstance(value, torch.Tensor)
+                },
                 "canonical_l0": canonical_l0,
                 "l0_ratio": l0_ratio,
                 "direction_scale": direction_scale,
