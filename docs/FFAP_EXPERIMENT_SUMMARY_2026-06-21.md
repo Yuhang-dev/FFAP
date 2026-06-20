@@ -17,7 +17,7 @@ The experiment sequence reached three practical conclusions.
 
 1. Stage 1 established the pruning phenomenon on `google/gemma-2-2b`: Wanda preserves WikiText PPL and SAE feature fidelity much better than local magnitude pruning at the same sparsity.
 2. Stage 2 v2 correlation-style gates were unstable: one configuration looked like a `PASS_CANDIDATE`, but more constrained configurations collapsed to ties with geometry or PPL. This supported the decision to redesign Stage 2 rather than treat the correlation gate as final evidence.
-3. Stage 2 v3 refusal measurement gate must stop at `INCONCLUSIVE_R0`: the matched Gemma Scope 9B-IT SAEs did not pass reconstruction compatibility, and diagnostics ruled out prompt-final denominator, wrapper normalization, HF pre/post hook mismatch, simple scale mismatch, `b_dec` input centering, and HF-vs-TransformerLens hook mismatch as sufficient fixes.
+3. Stage 2 v3 refusal measurement gate must stop at `INCONCLUSIVE_R0`: the matched Gemma Scope 9B-IT SAEs did not pass reconstruction compatibility. Diagnostics ruled out the cheap fixes: prompt-final denominator, wrapper normalization, HF pre/post hook mismatch, simple scale mismatch, `b_dec` input centering, and HF-vs-TransformerLens hook mismatch. The root cause remains unidentified inside this matched-IT canonical SAE route, with the main suspicion now being release-specific activation-definition or loader alignment.
 
 Current actionable state:
 
@@ -608,7 +608,7 @@ Conclusion:
 - Stage 1 supports that Wanda is a much stronger pruning baseline than local magnitude for preserving PPL and SAE feature fidelity on Gemma 2B.
 - Stage 2 v2 supports that the simple correlation gate is fragile and not sufficient as proof.
 - Stage 2 v3 smoke supports that the new seven-arm local intervention pipeline is mechanically runnable.
-- Stage 2 v3 full R0 supports that current matched 9B-IT SAE reconstruction compatibility is insufficient for refusal-feature measurement.
+- Stage 2 v3 full R0 supports that the current matched 9B-IT canonical SAE route is not compatible enough for refusal-feature measurement as implemented.
 
 ### What Is Not Supported
 
@@ -620,7 +620,7 @@ Conclusion:
 
 ### Current Best Scientific Reading
 
-The current refusal branch is blocked by measurement validity, not by a negative intervention result.
+The current refusal branch is blocked by measurement validity, not by a negative intervention result. The diagnostics identify this as a matched-SAE reconstruction/alignment problem, but they do not uniquely identify the root cause inside the Gemma Scope 9B-IT canonical release.
 
 The correct gate status is:
 
@@ -631,7 +631,7 @@ INCONCLUSIVE_R0
 The reason:
 
 ```text
-Matched Gemma Scope 9B-IT residual SAEs did not pass reconstruction compatibility for the current v3 local refusal measurement setup.
+Matched Gemma Scope 9B-IT canonical residual SAEs did not pass reconstruction compatibility for the current v3 local refusal measurement setup; cheap implementation fixes were ruled out, but the exact release/activation-definition mismatch remains unidentified.
 ```
 
 ## Reproducibility And Quality Notes

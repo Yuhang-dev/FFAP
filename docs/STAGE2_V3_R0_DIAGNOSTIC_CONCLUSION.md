@@ -6,7 +6,7 @@ Date: 2026-06-21
 
 Stage 2 v3 must remain stopped at `INCONCLUSIVE_R0`.
 
-The current evidence does not support running v3 causal, intervention, judge, or manual-audit stages. The failure is not a PASS/REFRAME/FAIL result for FFAP. It is a refusal-measurement gate failure: the matched Gemma Scope 9B-IT residual SAEs did not pass the reconstruction compatibility requirement on the tested layer/token settings.
+The current evidence does not support running v3 causal, intervention, judge, or manual-audit stages. The failure is not a PASS/REFRAME/FAIL result for FFAP. It is a refusal-measurement gate failure: the matched Gemma Scope 9B-IT canonical residual SAEs did not pass the reconstruction compatibility requirement on the tested layer/token settings.
 
 ## Decision
 
@@ -17,9 +17,11 @@ The strongest interpretation is:
 - Layer 31 still shows refusal-direction mediation in the original layer scan.
 - However, no candidate SAE has acceptable reconstruction compatibility.
 - The mismatch persists under HF hooks and TransformerLens `hook_resid_post`.
-- Therefore the current matched IT SAE path is blocked for the v3 local refusal measurement gate.
+- Therefore the current matched IT canonical SAE path is blocked for the v3 local refusal measurement gate.
 
 This is not evidence that refusal features do not exist, and not evidence against the pruning method. It means the v3 refusal target is not yet measurable with this SAE setup.
+
+The diagnostics below rule out the cheap fixes. They do not fully identify the root cause inside the `gemma-scope-9b-it-res-canonical` route. The leading remaining suspicion is release-specific activation-definition or loader alignment, not a simple implementation mistake in the current HF/TL hook collection.
 
 ## Inputs Reviewed
 
@@ -150,7 +152,7 @@ The following implementation explanations have been tested and ruled out:
 - `b_dec` input-centering mismatch.
 - HF hook implementation mismatch relative to TransformerLens `hook_resid_post`.
 
-The remaining defensible conclusion is that the selected `gemma-scope-9b-it-res-canonical` SAEs do not pass the v3 R0 reconstruction compatibility gate for this local refusal-measurement setup.
+The remaining defensible conclusion is narrower: the selected `gemma-scope-9b-it-res-canonical` route does not pass the v3 R0 reconstruction compatibility gate for this local refusal-measurement setup, after ruling out the cheap implementation fixes above. The exact source of the mismatch remains unresolved within that release/loader/activation-definition path.
 
 ## Consequences For The Experiment
 
@@ -171,7 +173,7 @@ Do not interpret this as:
 Interpret it as:
 
 ```text
-Matched-SAE transfer/reconstruction compatibility is insufficient for the current refusal measurement gate.
+Matched-SAE transfer/reconstruction compatibility is insufficient for the current refusal measurement gate; cheap implementation fixes were ruled out, but the exact matched-IT canonical release mismatch remains unidentified.
 ```
 
 ## Recommended Next Paths
