@@ -95,6 +95,7 @@ def main() -> int:
     parser.add_argument("--compatibility-text-limit", type=int, default=256)
     parser.add_argument("--compatibility-token-limit", type=int, default=8192)
     parser.add_argument("--hook-points", default="post,pre")
+    parser.add_argument("--modes", default="raw")
     parser.add_argument("--scale-scan", default="0.125,0.25,0.333333,0.5,0.75,1.0,1.5,2.0")
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
@@ -150,7 +151,10 @@ def main() -> int:
                 args.compatibility_token_limit,
                 hook_point=hook_point,
             )
-            for mode, wrapped in (("raw", False), ("wrapped", True)):
+            for mode in _strings(args.modes):
+                if mode not in {"raw", "wrapped"}:
+                    raise ValueError(f"Unknown diagnostic mode: {mode}")
+                wrapped = mode == "wrapped"
                 sae, metadata = _load_sae(args.sae_release, sae_id, args.device, wrapped)
                 try:
                     token_metrics = feature_metrics(sae, token_hidden, args.device, "token_level")
