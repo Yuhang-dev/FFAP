@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,25 @@ def _floats(raw: str) -> tuple[float, ...]:
     return tuple(float(item.strip()) for item in raw.split(",") if item.strip())
 
 
+@contextmanager
+def _sae_input_bias_mode(sae: Any, mode: str):
+    if mode not in {"cfg", "force_subtract", "force_none"}:
+        raise ValueError(f"Unknown input bias mode: {mode}")
+    cfg = getattr(sae, "cfg", None)
+    if cfg is None or not hasattr(cfg, "apply_b_dec_to_input"):
+        yield
+        return
+    original = bool(getattr(cfg, "apply_b_dec_to_input"))
+    if mode == "force_subtract":
+        cfg.apply_b_dec_to_input = True
+    elif mode == "force_none":
+        cfg.apply_b_dec_to_input = False
+    try:
+        yield
+    finally:
+        cfg.apply_b_dec_to_input = original
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stage 2 v3 R0 SAE diagnostic")
     parser.add_argument("--model-id", default="google/gemma-2-9b-it")
@@ -96,6 +116,7 @@ def main() -> int:
     parser.add_argument("--compatibility-token-limit", type=int, default=8192)
     parser.add_argument("--hook-points", default="post,pre")
     parser.add_argument("--modes", default="raw")
+    parser.add_argument("--input-bias-modes", default="cfg,force_subtract")
     parser.add_argument("--scale-scan", default="0.125,0.25,0.333333,0.5,0.75,1.0,1.5,2.0")
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
@@ -157,30 +178,46 @@ def main() -> int:
                 wrapped = mode == "wrapped"
                 sae, metadata = _load_sae(args.sae_release, sae_id, args.device, wrapped)
                 try:
-                    token_metrics = feature_metrics(sae, token_hidden, args.device, "token_level")
-                    prompt_metrics = feature_metrics(sae, prompt_hidden, args.device, "prompt_final")
-                    rows.append(
-                        {
-                            "layer": layer,
-                            "sae_id": sae_id,
-                            "hook_point": hook_point,
-                            "mode": mode,
-                            "sae_metadata": metadata,
-                            "token_level": _metric_subset(token_metrics),
-                            "prompt_final": _metric_subset(prompt_metrics),
-                            "token_level_scale_scan": [
-                                _metric_subset(row) | {"input_scale": row["input_scale"]}
-                                for row in feature_scale_scan(
-                                    sae,
-                                    token_hidden,
-                                    args.device,
-                                    _floats(args.scale_scan),
-                                    f"{hook_point}_token_level",
-                                )
-                            ],
-                            "status": "PASS",
-                        }
-                    )
+                    for bias_mode in _strings(args.input_bias_modes):
+                        with _sae_input_bias_mode(sae, bias_mode):
+                            token_metrics = feature_metrics(
+                                sae, token_hidden, args.device, "token_level"
+                            )
+                            prompt_metrics = feature_metrics(
+                                sae, prompt_hidden, args.device, "prompt_final"
+                            )
+                            runtime = {
+                                **metadata["runtime_normalization"],
+                                "effective_apply_b_dec_to_input": getattr(
+                                    getattr(sae, "cfg", None), "apply_b_dec_to_input", None
+                                ),
+                            }
+                            rows.append(
+                                {
+                                    "layer": layer,
+                                    "sae_id": sae_id,
+                                    "hook_point": hook_point,
+                                    "mode": mode,
+                                    "input_bias_mode": bias_mode,
+                                    "sae_metadata": {
+                                        **metadata,
+                                        "runtime_normalization": runtime,
+                                    },
+                                    "token_level": _metric_subset(token_metrics),
+                                    "prompt_final": _metric_subset(prompt_metrics),
+                                    "token_level_scale_scan": [
+                                        _metric_subset(row) | {"input_scale": row["input_scale"]}
+                                        for row in feature_scale_scan(
+                                            sae,
+                                            token_hidden,
+                                            args.device,
+                                            _floats(args.scale_scan),
+                                            f"{hook_point}_{bias_mode}_token_level",
+                                        )
+                                    ],
+                                    "status": "PASS",
+                                }
+                            )
                 except Exception as error:
                     rows.append(
                         {
@@ -188,6 +225,7 @@ def main() -> int:
                             "sae_id": sae_id,
                             "hook_point": hook_point,
                             "mode": mode,
+                            "input_bias_modes": _strings(args.input_bias_modes),
                             "sae_metadata": metadata,
                             "status": "FAIL",
                             "error": {"type": type(error).__name__, "message": str(error)},
