@@ -106,6 +106,7 @@ class Stage2V3Tests(unittest.TestCase):
 
     def test_cache_key_changes_with_response(self):
         config = Stage2V3Config()
+        self.assertFalse(config.use_sae_runtime_wrapper)
         self.assertNotEqual(
             cache_key(config, "harmful", "p", "a"),
             cache_key(config, "harmful", "p", "b"),

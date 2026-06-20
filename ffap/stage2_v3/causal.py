@@ -14,7 +14,7 @@ from .config import CANONICAL_L0, Stage2V3Config
 from .data import PromptExample
 from .judge import keyword_refusal
 from .legacy import task_gate, v2
-from .sae_runtime import ensure_sae_runtime_normalization
+from .sae_runtime import ensure_sae_runtime_normalization, sae_runtime_summary
 
 
 def layer_from_sae_id(sae_id: str) -> int:
@@ -337,7 +337,11 @@ def run_layer_scan(
     for sae_id in config.sae_ids:
         layer = layer_from_sae_id(sae_id)
         sae, _metadata = v2.load_sae_compat(config.sae_release, sae_id, device)
-        runtime_norm = ensure_sae_runtime_normalization(sae)
+        runtime_norm = (
+            ensure_sae_runtime_normalization(sae)
+            if config.use_sae_runtime_wrapper
+            else {**sae_runtime_summary(sae), "wrapped": False, "reason": "disabled_by_default"}
+        )
         v2.freeze_sae(sae)
         harmful_hidden = collect_prompt_hidden(
             model, tokenizer, [item.prompt for item in harmful_calibration], layer,

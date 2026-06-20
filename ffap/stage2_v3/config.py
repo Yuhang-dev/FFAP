@@ -101,6 +101,7 @@ class Stage2V3Config:
     compatibility_text_limit: int = 256
     compatibility_max_length: int = 256
     compatibility_token_limit: int = 8192
+    use_sae_runtime_wrapper: bool = False
     use_chat_template: bool = True
     output_root: Path = Path("results/stage2_v3")
     log_root: Path = Path("logs")

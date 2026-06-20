@@ -62,6 +62,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--compatibility-text-limit", type=int, default=256)
     result.add_argument("--compatibility-max-length", type=int, default=256)
     result.add_argument("--compatibility-token-limit", type=int, default=8192)
+    result.add_argument("--use-sae-runtime-wrapper", action="store_true")
     result.add_argument("--bootstrap-samples", type=int, default=10000)
     result.add_argument("--judge-base-url", default="https://api.deepseek.com")
     result.add_argument("--judge-model", default="deepseek-v4-flash")
@@ -107,6 +108,7 @@ def config_from_args(args: argparse.Namespace) -> Stage2V3Config:
         compatibility_text_limit=args.compatibility_text_limit,
         compatibility_max_length=args.compatibility_max_length,
         compatibility_token_limit=args.compatibility_token_limit,
+        use_sae_runtime_wrapper=args.use_sae_runtime_wrapper,
         bootstrap_samples=args.bootstrap_samples,
         judge_base_url=args.judge_base_url,
         judge_model=args.judge_model,

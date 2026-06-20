@@ -42,12 +42,18 @@ Run each expensive stage separately so completed artifacts survive shutdowns:
 
 ```bash
 bash remote/run_stage2_gate_causal_v3.sh --step prepare
+bash remote/run_stage2_v3_r0_diagnostic.sh
 bash remote/run_stage2_gate_causal_v3.sh --step layer-scan
 bash remote/run_stage2_gate_causal_v3.sh --step causal
 bash remote/run_stage2_gate_causal_v3.sh --step intervention
 bash remote/run_stage2_gate_causal_v3.sh --step judge
 bash remote/run_stage2_gate_causal_v3.sh --step manual-export
 ```
+
+The R0 diagnostic compares raw SAE `encode/decode` against the optional runtime
+wrapper on token-level and prompt-final activations. The Stage 2 v3 gate uses raw
+SAE calls by default; only enable the wrapper with `--use-sae-runtime-wrapper`
+after the diagnostic shows it is needed.
 
 Two blinded files are then created:
 
