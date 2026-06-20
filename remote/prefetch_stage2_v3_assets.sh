@@ -10,6 +10,9 @@ configure_ffap_env
 
 export HF_HUB_DISABLE_XET=1
 unset HF_XET_HIGH_PERFORMANCE
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 export PYTHONPATH="$FFAP_ROOT:$FFAP_ROOT/scripts:${PYTHONPATH:-}"
 mkdir -p logs results/stage2_v3
 

@@ -317,6 +317,11 @@ def run_layer_scan(
             torch.cuda.empty_cache()
     eligible = [item for item in candidates if item["eligible"]]
     selected = max(eligible, key=lambda item: item["selection_score"]) if eligible else None
+    smoke_override = False
+    if selected is None and config.extra.get("smoke") and candidates:
+        selected = max(candidates, key=lambda item: item["selection_score"])
+        selected = {**selected, "smoke_override": True, "eligible": False}
+        smoke_override = True
     artifact_dir = config.output_root / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     for layer, direction in directions.items():
@@ -326,10 +331,13 @@ def run_layer_scan(
         torch.cuda.empty_cache()
     return {
         "status": "PASS" if selected else "INCONCLUSIVE_R0",
+        "smoke_override": smoke_override,
         "selected": selected,
         "candidates": candidates,
         "conclusion": (
-            f"Layer {selected['layer']} passed matched-SAE transfer and directional mediation gates."
+            f"Layer {selected['layer']} was selected by smoke override for plumbing only; this is not R0 evidence."
+            if smoke_override
+            else f"Layer {selected['layer']} passed matched-SAE transfer and directional mediation gates."
             if selected
             else "No candidate layer passed both matched-SAE transfer and directional mediation gates."
         ),
