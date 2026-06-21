@@ -47,6 +47,18 @@ def _ints(raw: str) -> tuple[int, ...]:
     return tuple(int(item.strip()) for item in raw.split(",") if item.strip())
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(result):
+        return None
+    return result
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
@@ -190,6 +202,39 @@ def _normalize_score_maps(score_maps: dict[str, torch.Tensor]) -> dict[str, torc
     if max_value <= 0:
         raise RuntimeError("Cross-layer gradient importance collapsed to zero.")
     return {name: value / max_value for name, value in score_maps.items()}
+
+
+def _rank_average(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.shape[0], dtype=np.float64)
+    sorted_values = values[order]
+    start = 0
+    while start < sorted_values.shape[0]:
+        end = start + 1
+        while end < sorted_values.shape[0] and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1)
+        start = end
+    return ranks
+
+
+def spearman_1d(left: Any, right: Any) -> float | None:
+    left_array = np.asarray(left, dtype=np.float64).reshape(-1)
+    right_array = np.asarray(right, dtype=np.float64).reshape(-1)
+    if left_array.shape != right_array.shape or left_array.size < 2:
+        return None
+    mask = np.isfinite(left_array) & np.isfinite(right_array)
+    left_array = left_array[mask]
+    right_array = right_array[mask]
+    if left_array.size < 2:
+        return None
+    left_rank = _rank_average(left_array)
+    right_rank = _rank_average(right_array)
+    left_std = float(left_rank.std())
+    right_std = float(right_rank.std())
+    if left_std <= 0 or right_std <= 0:
+        return None
+    return float(np.corrcoef(left_rank, right_rank)[0, 1])
 
 
 def crosslayer_feature_grad_scores(
@@ -398,6 +443,19 @@ def paired_bootstrap(
     }
 
 
+def directional_positive(test: dict[str, Any]) -> bool:
+    mean_difference = _optional_float(test.get("mean_difference"))
+    return mean_difference is not None and mean_difference > 0
+
+
+def ci95_positive(test: dict[str, Any]) -> bool:
+    ci95 = test.get("ci95")
+    if not isinstance(ci95, list) or len(ci95) != 2:
+        return False
+    lower = _optional_float(ci95[0])
+    return lower is not None and lower > 0
+
+
 def summarize_group_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     output = []
     groups = sorted(set(row["group"] for row in rows))
@@ -424,6 +482,154 @@ def score_summary(score_maps: dict[str, torch.Tensor]) -> dict[str, Any]:
         "q50": float(torch.quantile(values, 0.50)),
         "q90": float(torch.quantile(values, 0.90)),
         "q99": float(torch.quantile(values, 0.99)),
+    }
+
+
+def feature_reference_diagnostics(
+    causal_scores: torch.Tensor,
+    reference: dict[str, Any],
+) -> dict[str, Any]:
+    causal = causal_scores.detach().float().cpu()
+    firing = reference["firing_rate"].detach().float().cpu()
+    activity = reference["activity_mass"].detach().float().cpu()
+    positive = causal.clamp_min(0)
+    return {
+        "features": int(causal.numel()),
+        "positive_causal_features": int((positive > 0).sum()),
+        "causal_vs_firing_spearman": spearman_1d(causal.numpy(), firing.numpy()),
+        "positive_causal_vs_firing_spearman": spearman_1d(positive.numpy(), firing.numpy()),
+        "causal_vs_activity_mass_spearman": spearman_1d(causal.numpy(), activity.numpy()),
+        "positive_causal_vs_activity_mass_spearman": spearman_1d(
+            positive.numpy(), activity.numpy()
+        ),
+    }
+
+
+def score_vs_wanda_diagnostics(
+    model: Any,
+    input_stats: dict[str, dict[str, Any]],
+    writer_names: list[str],
+    score_maps: dict[str, torch.Tensor],
+    sample_limit: int,
+    top_fractions: tuple[float, ...],
+    seed: int,
+) -> dict[str, Any]:
+    modules = dict(model.named_modules())
+    total_weights = sum(int(score_maps[name].numel()) for name in writer_names)
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    sampled_left: list[np.ndarray] = []
+    sampled_right: list[np.ndarray] = []
+    per_module = []
+    for name in writer_names:
+        module = modules[name]
+        score_flat = score_maps[name].detach().float().cpu().reshape(-1)
+        weight = module.weight.detach()
+        rows, cols = weight.shape
+        numel = int(score_flat.numel())
+        sample_count = max(1, int(sample_limit * numel / max(1, total_weights)))
+        sample_count = min(sample_count, numel)
+        sample_indices = torch.randint(numel, (sample_count,), generator=generator)
+        sample_rows = torch.div(sample_indices, cols, rounding_mode="floor").to(weight.device)
+        sample_cols = (sample_indices % cols).to(weight.device)
+        rms = input_stats[f"{name}.weight"]["rms"].to(weight.device)
+        wanda_sample = (
+            weight.abs().float()[sample_rows, sample_cols] * rms[sample_cols]
+        ).detach().cpu()
+        score_sample = score_flat[sample_indices]
+        sampled_left.append(score_sample.numpy())
+        sampled_right.append(wanda_sample.numpy())
+
+        top_overlaps = {}
+        for fraction in top_fractions:
+            if not 0 < fraction < 1:
+                continue
+            k = max(1, int(numel * fraction))
+            k = min(k, numel)
+            score_top = torch.topk(score_flat, k, largest=True).indices
+            rms_cpu = input_stats[f"{name}.weight"]["rms"].detach().float().cpu()
+            wanda_flat = (weight.detach().float().cpu().abs() * rms_cpu.unsqueeze(0)).reshape(-1)
+            wanda_top = torch.topk(wanda_flat, k, largest=True).indices
+            score_mask = torch.zeros(numel, dtype=torch.bool)
+            wanda_mask = torch.zeros(numel, dtype=torch.bool)
+            score_mask[score_top] = True
+            wanda_mask[wanda_top] = True
+            intersection = int((score_mask & wanda_mask).sum())
+            union = int((score_mask | wanda_mask).sum())
+            top_overlaps[f"top_{fraction:g}"] = {
+                "k": int(k),
+                "intersection": intersection,
+                "recall_at_k": intersection / max(1, k),
+                "jaccard": intersection / max(1, union),
+            }
+            del wanda_flat, score_top, wanda_top, score_mask, wanda_mask
+        per_module.append(
+            {
+                "module": name,
+                "weights": numel,
+                "sample_count": sample_count,
+                "sample_spearman": spearman_1d(score_sample.numpy(), wanda_sample.numpy()),
+                "top_overlap": top_overlaps,
+            }
+        )
+    left = np.concatenate(sampled_left) if sampled_left else np.asarray([], dtype=np.float32)
+    right = np.concatenate(sampled_right) if sampled_right else np.asarray([], dtype=np.float32)
+    return {
+        "sampled_weights": int(left.size),
+        "total_writer_weights": int(total_weights),
+        "sample_spearman": spearman_1d(left, right),
+        "top_fractions": list(top_fractions),
+        "per_module": per_module,
+        "note": "Wanda score is abs(weight) times calibration RMS; Spearman is sampled to avoid a second full-size score map.",
+    }
+
+
+def dense_sae_sanity(features: dict[str, Any]) -> dict[str, Any]:
+    tokens = int(features.get("tokens", 0))
+    active = int(features.get("active_features_count", 0))
+    firing = features.get("firing_rate")
+    total_features = int(firing.numel()) if isinstance(firing, torch.Tensor) else None
+    dead_rate = None if not total_features else 1.0 - active / max(1, total_features)
+    return {
+        "tokens": tokens,
+        "active_features_count": active,
+        "dead_feature_rate": dead_rate,
+        "l0": features.get("l0"),
+        "reconstruction_mse": features.get("reconstruction_mse"),
+        "decoded_activation_cosine": features.get("decoded_activation_cosine"),
+        "note": "2B matched SAE sanity check; EV is not computed by the Stage 1 feature collector.",
+    }
+
+
+def summarize_mask_diagnostics(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"available": False, "reason": f"{path} not found"}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    diagnostics = payload.get("diagnostics", [])
+    pair_values: dict[str, list[float]] = {}
+    identical_counts: dict[str, int] = {}
+    counts: list[dict[str, int]] = []
+    for item in diagnostics:
+        if "counts" in item:
+            counts.append({key: int(value) for key, value in item["counts"].items()})
+        for pair, values in item.get("pairwise", {}).items():
+            pair_values.setdefault(pair, []).append(float(values["jaccard"]))
+            identical_counts[pair] = identical_counts.get(pair, 0) + int(
+                bool(values.get("identical", False))
+            )
+    return {
+        "available": True,
+        "n_conditions": len(diagnostics),
+        "counts": counts,
+        "pairwise": {
+            pair: {
+                "n": len(values),
+                "mean_jaccard": float(np.mean(values)),
+                "min_jaccard": float(np.min(values)),
+                "max_jaccard": float(np.max(values)),
+                "identical_count": identical_counts.get(pair, 0),
+            }
+            for pair, values in sorted(pair_values.items())
+        },
     }
 
 
@@ -516,12 +722,34 @@ def run_seed(args: argparse.Namespace, seed: int, device: str) -> dict[str, Any]
         args.max_length,
         device,
     )
+    saliency_diagnostics = {
+        "feature_causal_vs_reference": feature_reference_diagnostics(ability_causal, reference),
+        "A_feature_grad_vs_B_wanda_score": score_vs_wanda_diagnostics(
+            dense,
+            input_stats,
+            writer_names,
+            feature_scores,
+            args.diagnostic_score_sample,
+            args.diagnostic_top_fractions,
+            seed + 1009,
+        ),
+        "A_loss_grad_vs_B_wanda_score": score_vs_wanda_diagnostics(
+            dense,
+            input_stats,
+            writer_names,
+            loss_scores,
+            args.diagnostic_score_sample,
+            (),
+            seed + 2027,
+        ),
+    }
     _dense_loss, dense_rows = evaluate_objective(
         dense, tokenizer, test_batches, args.max_length, device
     )
     dense_summary = objective_summary(dense_rows)
     dense_ppl = None if args.skip_ppl else evaluate_ppl(dense, ppl_blocks)["ppl"]
     dense_features = collect_feature_stats(dense, sae, feature_blocks, args.layer)
+    saliency_diagnostics["dense_sae_sanity"] = dense_sae_sanity(dense_features)
     del dense
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -656,6 +884,7 @@ def run_seed(args: argparse.Namespace, seed: int, device: str) -> dict[str, Any]
         "ability_meta": ability_meta,
         "feature_score_summary": score_summary(feature_scores),
         "loss_score_summary": score_summary(loss_scores),
+        "saliency_diagnostics": saliency_diagnostics,
         "model_rows": model_rows,
         "ability_rows": ability_rows,
         "diagnostics": diagnostics,
@@ -700,15 +929,29 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         ),
     }
     group_summary = summarize_group_rows(ability_rows)
-    feature_beats_wanda = (
-        tests["feature_vs_wanda_correct"]["mean_difference"] is not None
-        and tests["feature_vs_wanda_correct"]["mean_difference"] > 0
+    directional_signal = {
+        name: directional_positive(test)
+        for name, test in tests.items()
+    }
+    strict_signal = {
+        name: ci95_positive(test)
+        for name, test in tests.items()
+    }
+    feature_directional = (
+        directional_signal["feature_vs_wanda_correct"]
+        and directional_signal["feature_vs_random_correct"]
     )
-    feature_beats_random = (
-        tests["feature_vs_random_correct"]["mean_difference"] is not None
-        and tests["feature_vs_random_correct"]["mean_difference"] > 0
+    feature_strict = (
+        strict_signal["feature_vs_wanda_correct"]
+        and strict_signal["feature_vs_random_correct"]
     )
-    gate_status = "W1_PASS_CANDIDATE" if feature_beats_wanda and feature_beats_random else "W1_INCONCLUSIVE"
+    if feature_strict:
+        gate_status = "W1_PASS_CANDIDATE"
+    elif feature_directional:
+        gate_status = "W1_DIRECTIONAL_CANDIDATE"
+    else:
+        gate_status = "W1_INCONCLUSIVE"
+    mask_overlap_summary = summarize_mask_diagnostics(args.output_root / "mask_diagnostics.json")
     result = {
         "step": "stage2_w1_analyze",
         "status": "PASS",
@@ -716,11 +959,29 @@ def analyze(args: argparse.Namespace) -> dict[str, Any]:
         "config": vars(args),
         "group_summary": group_summary,
         "paired_tests": tests,
+        "directional_signal": directional_signal,
+        "strict_signal": strict_signal,
+        "mask_overlap_summary": mask_overlap_summary,
+        "gate_rule": {
+            "directional_candidate": (
+                "A_feature_grad mean paired accuracy difference is positive versus "
+                "B_wanda and C_random."
+            ),
+            "pass_candidate": (
+                "A_feature_grad 95% bootstrap CI lower bound is positive versus "
+                "B_wanda and C_random. A_loss_grad is reported as a direct-loss "
+                "baseline and does not drive the FFAP gate."
+            ),
+        },
         "model_rows": model_rows,
         "conclusion": (
-            "Feature-fidelity cross-layer protection improved held-out ability over Wanda-geometry and random controls."
+            "Feature-fidelity cross-layer protection has a strict positive held-out ability signal over Wanda-geometry and random controls."
             if gate_status == "W1_PASS_CANDIDATE"
-            else "W1 did not show a clear feature-fidelity advantage over both Wanda-geometry and random controls."
+            else (
+                "Feature-fidelity cross-layer protection has a directional positive signal, but the strict bootstrap gate did not pass."
+                if gate_status == "W1_DIRECTIONAL_CANDIDATE"
+                else "W1 did not show a clear feature-fidelity advantage over both Wanda-geometry and random controls."
+            )
         ),
     }
     write_json(args.final_json, result)
@@ -779,6 +1040,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "ability_examples": seed_result["ability_meta"]["examples"],
                 "feature_score_summary": seed_result["feature_score_summary"],
                 "loss_score_summary": seed_result["loss_score_summary"],
+                "saliency_diagnostics": seed_result["saliency_diagnostics"],
             },
             "diagnostics": seed_result["diagnostics"],
         }
@@ -852,6 +1114,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--ppl-blocks", type=int, default=16)
     result.add_argument("--skip-ppl", action="store_true")
     result.add_argument("--bootstrap-samples", type=int, default=5000)
+    result.add_argument("--diagnostic-score-sample", type=int, default=200000)
+    result.add_argument("--diagnostic-top-fractions", default="0.001")
     result.add_argument("--use-chat-template", action="store_true")
     result.add_argument("--output-root", type=Path, default=Path("results/stage2_w1_ability"))
     result.add_argument("--log-root", type=Path, default=Path("logs"))
@@ -864,6 +1128,7 @@ def parser() -> argparse.ArgumentParser:
 def config_from_args(args: argparse.Namespace) -> argparse.Namespace:
     args.seeds = _ints(args.seeds)
     args.sparsities = _floats(args.sparsities)
+    args.diagnostic_top_fractions = _floats(args.diagnostic_top_fractions)
     if args.smoke:
         args.ability_calibration_per_task = min(args.ability_calibration_per_task, 8)
         args.ability_test_per_task = min(args.ability_test_per_task, 8)
@@ -873,6 +1138,7 @@ def config_from_args(args: argparse.Namespace) -> argparse.Namespace:
         args.feature_blocks = 2
         args.ppl_blocks = 2
         args.bootstrap_samples = 500
+        args.diagnostic_score_sample = min(args.diagnostic_score_sample, 20000)
         args.output_root = Path("results/stage2_w1_ability_smoke")
         args.final_json = Path("results/stage2_w1_ability_smoke.json")
         args.skip_ppl = True
@@ -880,6 +1146,10 @@ def config_from_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--protect-fraction must be in (0, 1).")
     if any(not 0 < value < 1 for value in args.sparsities):
         raise ValueError("--sparsities must all be in (0, 1).")
+    if args.diagnostic_score_sample <= 0:
+        raise ValueError("--diagnostic-score-sample must be positive.")
+    if any(not 0 < value < 1 for value in args.diagnostic_top_fractions):
+        raise ValueError("--diagnostic-top-fractions must all be in (0, 1).")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("W1 requires CUDA.")
     return args

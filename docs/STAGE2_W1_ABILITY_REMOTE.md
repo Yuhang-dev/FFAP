@@ -25,6 +25,10 @@ This branch intentionally does not use the blocked Stage 2 v3 refusal measuremen
   - `C_random`: protect random at-risk weights
   - `D_wanda_no_protection`: plain whole-model Wanda, no protection
 
+`B_wanda` is an at-risk rescue control: within the weights plain Wanda would
+prune, it rescues the highest Wanda-score weights. It is not the same as the
+plain Wanda baseline (`D_wanda_no_protection`).
+
 ## Smoke
 
 ```bash
@@ -77,7 +81,12 @@ The first W1 gate is a candidate gate, not a final paper claim.
 Useful status values:
 
 - `W1_PASS_CANDIDATE`: `A_feature_grad` has positive paired accuracy difference over both `B_wanda` and `C_random`.
+- `W1_DIRECTIONAL_CANDIDATE`: `A_feature_grad` has positive mean paired accuracy difference over both controls, but the strict bootstrap CI gate did not pass.
 - `W1_INCONCLUSIVE`: no clear advantage over both controls.
+
+`W1_PASS_CANDIDATE` is strict: the 95% bootstrap CI lower bound must be positive
+for `A_feature_grad` versus both `B_wanda` and `C_random`. Direction-only signals
+are retained separately for triage.
 
 Primary fields:
 
@@ -86,6 +95,21 @@ Primary fields:
 - `paired_tests.feature_vs_random_correct`
 - `paired_tests.feature_vs_no_protection_correct`
 - `paired_tests.loss_vs_wanda_correct`
+- `directional_signal`
+- `strict_signal`
+- `mask_overlap_summary`
+
+Seed-level diagnostics are written in `seed*_diagnostics.json` under
+`summary.saliency_diagnostics`:
+
+- causal feature score versus firing/activity-mass Spearman correlations
+- sampled `A_feature_grad` versus Wanda-score Spearman
+- top score overlap for `A_feature_grad` versus Wanda score
+- matched 2B SAE sanity metrics (`L0`, decoded cosine, reconstruction MSE,
+  dead-feature rate)
+
+`A_loss_grad` is a direct ability-loss baseline. It is reported for comparison
+but does not drive the FFAP W1 gate.
 
 ## Disk Behavior
 
