@@ -473,15 +473,47 @@ def summarize_group_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def score_summary(score_maps: dict[str, torch.Tensor]) -> dict[str, Any]:
-    values = torch.cat([value.flatten() for value in score_maps.values()]).float()
+    flats = [value.detach().float().cpu().reshape(-1) for value in score_maps.values()]
+    total = sum(int(value.numel()) for value in flats)
+    if total <= 0:
+        raise RuntimeError("Cannot summarize an empty score map.")
+    nonzero = 0
+    max_value = 0.0
+    sum_value = 0.0
+    for value in flats:
+        if value.numel() == 0:
+            continue
+        nonzero += int((value > 0).sum())
+        max_value = max(max_value, float(value.max()))
+        sum_value += float(value.sum(dtype=torch.float64))
+
+    sample_limit = 1_000_000
+    samples = []
+    for value in flats:
+        numel = int(value.numel())
+        if numel == 0:
+            continue
+        if total <= sample_limit:
+            samples.append(value)
+            continue
+        sample_count = max(1, int(round(sample_limit * numel / total)))
+        sample_count = min(sample_count, numel)
+        if sample_count == numel:
+            samples.append(value)
+        else:
+            indices = torch.linspace(0, numel - 1, sample_count).round().to(torch.long)
+            samples.append(value[indices])
+    sampled_values = torch.cat(samples).float()
     return {
-        "weights": int(values.numel()),
-        "nonzero": int((values > 0).sum()),
-        "max": float(values.max()),
-        "mean": float(values.mean()),
-        "q50": float(torch.quantile(values, 0.50)),
-        "q90": float(torch.quantile(values, 0.90)),
-        "q99": float(torch.quantile(values, 0.99)),
+        "weights": int(total),
+        "nonzero": int(nonzero),
+        "max": max_value,
+        "mean": sum_value / max(1, total),
+        "q50": float(torch.quantile(sampled_values, 0.50)),
+        "q90": float(torch.quantile(sampled_values, 0.90)),
+        "q99": float(torch.quantile(sampled_values, 0.99)),
+        "quantile_sampled": bool(sampled_values.numel() < total),
+        "quantile_sample_size": int(sampled_values.numel()),
     }
 
 
