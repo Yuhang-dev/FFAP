@@ -501,7 +501,14 @@ def score_summary(score_maps: dict[str, torch.Tensor]) -> dict[str, Any]:
         if sample_count == numel:
             samples.append(value)
         else:
-            indices = torch.linspace(0, numel - 1, sample_count).round().to(torch.long)
+            if sample_count == 1:
+                indices = torch.zeros(1, dtype=torch.long)
+            else:
+                indices = (
+                    torch.arange(sample_count, dtype=torch.long)
+                    * (numel - 1)
+                    // (sample_count - 1)
+                )
             samples.append(value[indices])
     sampled_values = torch.cat(samples).float()
     return {
